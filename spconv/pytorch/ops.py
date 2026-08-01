@@ -71,11 +71,15 @@ def _gemm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         return torch.mm(a, b)
 
 _IMPLICIT_GEMM_AVAILABLE = False
-_USE_EXPLICIT_BWD = os.environ.get("SPCONV_USE_EXPLICIT_BWD", "0") == "1"
-_USE_FUSED_FORWARD = os.environ.get("SPCONV_ENABLE_FUSED_FORWARD", "1") != "0"
+_FORCE_NATIVE = os.environ.get("SPCONV_FORCE_NATIVE", "0") == "1"
+_USE_EXPLICIT_BWD = _FORCE_NATIVE or os.environ.get("SPCONV_USE_EXPLICIT_BWD", "0") == "1"
+_USE_FUSED_FORWARD = not _FORCE_NATIVE and os.environ.get("SPCONV_ENABLE_FUSED_FORWARD", "1") != "0"
 # Prefer the fused FP32 backward path by default.  Set this to 0 for the
 # strict Native gather -> GEMM -> scatter numerical route.
-_ALLOW_INEXACT_FUSED_FP32 = os.environ.get("SPCONV_ALLOW_INEXACT_FUSED_FP32", "1") != "0"
+_ALLOW_INEXACT_FUSED_FP32 = (
+    not _FORCE_NATIVE and
+    os.environ.get("SPCONV_ALLOW_INEXACT_FUSED_FP32", "1") != "0"
+)
 
 
 def _custom_fwd_cuda(fwd):

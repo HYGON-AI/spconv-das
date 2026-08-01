@@ -1072,6 +1072,9 @@ std::vector<torch::Tensor> indice_conv_backward(
 
     auto out_bp_contig = out_bp.contiguous();
     auto& workspace = get_workspace(features.device());
+    const char* force_native_env = std::getenv("SPCONV_FORCE_NATIVE");
+    const bool force_native =
+        force_native_env != nullptr && std::atoi(force_native_env) != 0;
     bool use_fused_dinput =
         (out_bp_contig.scalar_type() == torch::kFloat32 &&
          filters.scalar_type() == torch::kFloat32) ||
@@ -1127,6 +1130,10 @@ std::vector<torch::Tensor> indice_conv_backward(
     if (const char* env = std::getenv("SPCONV_WORKSPACE_ORDER_DINPUT")) {
         use_workspace_order_dinput = std::atoi(env) != 0;
     }
+    if (force_native) {
+        use_fused_dinput = false;
+        use_workspace_order_dinput = false;
+    }
     if (use_workspace_order_dinput) {
         din = indice_conv_dinput_fixed_order_f16(
             out_bp_contig, filters, indice_pairs, indice_pair_num, n_in, !inverse);
@@ -1174,6 +1181,9 @@ std::vector<torch::Tensor> indice_conv_backward(
 
     if ((features.scalar_type() == torch::kHalf || features.scalar_type() == torch::kBFloat16) &&
         c_in < 8) {
+        use_fused_dfilters = false;
+    }
+    if (force_native) {
         use_fused_dfilters = false;
     }
     auto dfilters = use_fused_dfilters ? torch::empty_like(filters)
