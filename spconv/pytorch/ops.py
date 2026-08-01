@@ -6,6 +6,7 @@ import os
 import torch
 import numpy as np
 from typing import List, Optional, Tuple
+from torch.autograd import Function
 from spconv.core import ConvAlgo
 from spconv.constants import ALL_WEIGHT_IS_KRSC, AllocKeys
 
@@ -60,7 +61,13 @@ def _gemm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     a: [M, K], b: [K, N] → output: [M, N]
     """
     tuner = _get_flydsl_tuner()
-    if tuner and a.dtype in (torch.float16, torch.bfloat16):
+    use_tuner = (
+        tuner and
+        a.dtype in (torch.float16, torch.bfloat16) and
+        not a.requires_grad and
+        not b.requires_grad
+    )
+    if use_tuner:
         m, k = a.shape
         n = b.shape[1]
         # FlyDSL interface: C = A @ B^T, so B must be [N, K]
@@ -71,14 +78,70 @@ def _gemm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     else:
         return torch.mm(a, b)
 
+_IMPLICIT_GEMM_AVAILABLE = False
+_USE_EXPLICIT_BWD = os.environ.get("SPCONV_USE_EXPLICIT_BWD", "0") == "1"
+_USE_FUSED_FORWARD = os.environ.get("SPCONV_ENABLE_FUSED_FORWARD", "1") != "0"
 
-_IMPLICIT_GEMM_AVAILABLE = None
+
+def _get_cuda_autocast_dtype() -> Optional[torch.dtype]:
+    if not torch.cuda.is_available():
+        return None
+    try:
+        return torch.get_autocast_dtype("cuda")
+    except (AttributeError, TypeError):
+        pass
+    try:
+        return torch.get_autocast_gpu_dtype()
+    except AttributeError:
+        return None
+
+
+def _should_use_amp_native_path(features: torch.Tensor,
+                                filters: torch.Tensor) -> bool:
+    if not features.is_cuda or not torch.is_autocast_enabled():
+        return False
+    if os.environ.get("SPCONV_USE_AMP_NATIVE_INPUTS", "0") != "1":
+        return False
+    amp_dtype = _get_cuda_autocast_dtype()
+    if amp_dtype not in (torch.float16, torch.bfloat16):
+        return False
+    return features.dtype == torch.float32 and filters.dtype == torch.float32
+
+
+def _should_cast_output_for_autocast(features: torch.Tensor,
+                                     filters: torch.Tensor) -> bool:
+    if not features.is_cuda or not torch.is_autocast_enabled():
+        return False
+    if os.environ.get("SPCONV_CAST_OUTPUT_FOR_AMP", "0") != "1":
+        return False
+    amp_dtype = _get_cuda_autocast_dtype()
+    if amp_dtype not in (torch.float16, torch.bfloat16):
+        return False
+    return features.dtype == torch.float32 and filters.dtype == torch.float32
+
+
+def _cast_output_for_autocast(out: torch.Tensor,
+                              features: torch.Tensor,
+                              filters: torch.Tensor) -> torch.Tensor:
+    if not _should_cast_output_for_autocast(features, filters):
+        return out
+    amp_dtype = _get_cuda_autocast_dtype()
+    if out.dtype == amp_dtype:
+        return out
+    return out.to(dtype=amp_dtype)
 
 def _try_implicit_gemm(features, filters, indice_pairs, indice_pair_num, num_activate_out):
-    """Try cumm-rocm implicit GEMM (fused gather+GEMM+scatter). Returns None if unavailable."""
+    """Try cumm-rocm implicit GEMM only when explicitly enabled.
+
+    Default is disabled to avoid FlyDSL `kernels` dependency warnings in
+    environments that only need native sparse conv path.
+    Enable by setting SPCONV_ENABLE_IMPLICIT_GEMM=1.
+    """
     global _IMPLICIT_GEMM_AVAILABLE
     if _IMPLICIT_GEMM_AVAILABLE is False:
-        return None
+        if os.environ.get("SPCONV_ENABLE_IMPLICIT_GEMM", "0") != "1":
+            return None
+        _IMPLICIT_GEMM_AVAILABLE = None
     try:
         from cumm.implicit_gemm import implicit_gemm_forward
         _IMPLICIT_GEMM_AVAILABLE = True
@@ -440,6 +503,90 @@ def _get_indice_pairs_hip(indices: torch.Tensor,
         return out_inds, ip, ip_num
 
 
+class _IndiceConvFunction(Function):
+    @staticmethod
+    @torch.amp.custom_fwd(device_type="cuda")
+    def forward(ctx,
+                features: torch.Tensor,
+                filters: torch.Tensor,
+                indice_pairs: torch.Tensor,
+                indice_pair_num: torch.Tensor,
+                num_activate_out: int,
+                inverse: bool,
+                subm: bool) -> torch.Tensor:
+        hip = _get_hip_module()
+        if hip is None or not features.is_cuda:
+            raise RuntimeError("_IndiceConvFunction requires HIP extension on device")
+
+        out = hip.indice_conv_forward(
+            features, filters, indice_pairs, indice_pair_num,
+            num_activate_out, inverse, subm)
+        ctx.save_for_backward(features, filters, indice_pairs, indice_pair_num)
+        ctx.inverse = inverse
+        ctx.subm = subm
+        return out
+
+    @staticmethod
+    @torch.amp.custom_bwd(device_type="cuda")
+    def backward(ctx, out_bp: torch.Tensor):
+        features, filters, indice_pairs, indice_pair_num = ctx.saved_tensors
+        din = dfilters = None
+        if ctx.needs_input_grad[0] or ctx.needs_input_grad[1]:
+            hip = _get_hip_module()
+            if hip is None:
+                raise RuntimeError("_IndiceConvFunction backward requires HIP extension")
+            din, dfilters = hip.indice_conv_backward(
+                features, filters, out_bp.contiguous(),
+                indice_pairs, indice_pair_num, ctx.inverse, ctx.subm)
+            if not ctx.needs_input_grad[0]:
+                din = None
+            if not ctx.needs_input_grad[1]:
+                dfilters = None
+        return din, dfilters, None, None, None, None, None
+
+
+class _IndiceConvFusedFunction(Function):
+    @staticmethod
+    @torch.amp.custom_fwd(device_type="cuda")
+    def forward(ctx,
+                features: torch.Tensor,
+                filters: torch.Tensor,
+                indice_pairs: torch.Tensor,
+                indice_pair_num: torch.Tensor,
+                num_activate_out: int,
+                inverse: bool,
+                subm: bool) -> torch.Tensor:
+        hip = _get_hip_module()
+        if hip is None or not features.is_cuda:
+            raise RuntimeError("_IndiceConvFusedFunction requires HIP extension on device")
+
+        out = hip.indice_conv_forward_fused(
+            features, filters, indice_pairs, indice_pair_num,
+            num_activate_out, inverse, subm)
+        ctx.save_for_backward(features, filters, indice_pairs, indice_pair_num)
+        ctx.inverse = inverse
+        ctx.subm = subm
+        return out
+
+    @staticmethod
+    @torch.amp.custom_bwd(device_type="cuda")
+    def backward(ctx, out_bp: torch.Tensor):
+        features, filters, indice_pairs, indice_pair_num = ctx.saved_tensors
+        din = dfilters = None
+        if ctx.needs_input_grad[0] or ctx.needs_input_grad[1]:
+            hip = _get_hip_module()
+            if hip is None:
+                raise RuntimeError("_IndiceConvFusedFunction backward requires HIP extension")
+            din, dfilters = hip.indice_conv_backward(
+                features, filters, out_bp.contiguous(),
+                indice_pairs, indice_pair_num, ctx.inverse, ctx.subm)
+            if not ctx.needs_input_grad[0]:
+                din = None
+            if not ctx.needs_input_grad[1]:
+                dfilters = None
+        return din, dfilters, None, None, None, None, None
+
+
 def get_indice_pairs(indices: torch.Tensor,
                      batch_size: int,
                      spatial_shape: List[int],
@@ -494,21 +641,53 @@ def indice_conv(features: torch.Tensor,
     Returns:
         out_features: [N_out, C_out]
     """
-    if features.is_cuda and not features.requires_grad:
+    if (not inverse) and features.is_cuda and not features.requires_grad:
         out = _try_implicit_gemm(features, filters, indice_pairs,
                                  indice_pair_num, num_activate_out)
         if out is not None:
-            return out
+            return _cast_output_for_autocast(out, features, filters)
 
     hip = _get_hip_module()
+    if _should_use_amp_native_path(features, filters):
+        amp_dtype = _get_cuda_autocast_dtype()
+        features_amp = features.to(dtype=amp_dtype)
+        filters_amp = filters.to(dtype=amp_dtype)
+        if hip is not None and features.is_cuda:
+            if _USE_EXPLICIT_BWD and (features.requires_grad or filters.requires_grad):
+                return _IndiceConvFunction.apply(
+                    features_amp, filters_amp, indice_pairs, indice_pair_num,
+                    num_activate_out, inverse, subm)
+            return hip.indice_conv_forward(
+                features_amp, filters_amp, indice_pairs, indice_pair_num,
+                num_activate_out, inverse, subm)
+        features = features_amp
+        filters = filters_amp
     if hip is not None and features.is_cuda:
-        return hip.indice_conv_forward(
+        if (_USE_FUSED_FORWARD and features.dtype == torch.float32 and
+                filters.dtype == torch.float32):
+            if features.requires_grad or filters.requires_grad:
+                out = _IndiceConvFusedFunction.apply(
+                    features, filters, indice_pairs, indice_pair_num,
+                    num_activate_out, inverse, subm)
+                return _cast_output_for_autocast(out, features, filters)
+            out = hip.indice_conv_forward_fused(
+                features, filters, indice_pairs, indice_pair_num,
+                num_activate_out, inverse, subm)
+            return _cast_output_for_autocast(out, features, filters)
+        if _USE_EXPLICIT_BWD and (features.requires_grad or filters.requires_grad):
+            out = _IndiceConvFunction.apply(
+                features, filters, indice_pairs, indice_pair_num,
+                num_activate_out, inverse, subm)
+            return _cast_output_for_autocast(out, features, filters)
+        out = hip.indice_conv_forward(
             features, filters, indice_pairs, indice_pair_num,
-            num_activate_out, subm)
+            num_activate_out, inverse, subm)
+        return _cast_output_for_autocast(out, features, filters)
 
     kv = filters.shape[0]
     c_in = features.shape[1]
     c_out = filters.shape[2]
+    center = kv // 2
     device = features.device
     dtype = features.dtype
 
@@ -519,8 +698,21 @@ def indice_conv(features: torch.Tensor,
         if n_act == 0:
             continue
 
-        inp_inds = indice_pairs[i, 0, :n_act].long()
-        out_inds = indice_pairs[i, 1, :n_act].long()
+        if subm and (not inverse) and i == center:
+            gemm_out = _gemm(features, filters[i])
+            if gemm_out.dtype != out_features.dtype:
+                gemm_out = gemm_out.to(out_features.dtype)
+            out_features = out_features + gemm_out
+            continue
+
+        if inverse:
+            # Inverse conv reuses forward-conv indice pairs, but reverses
+            # gather/scatter direction: current input corresponds to pair[1].
+            inp_inds = indice_pairs[i, 1, :n_act].long()
+            out_inds = indice_pairs[i, 0, :n_act].long()
+        else:
+            inp_inds = indice_pairs[i, 0, :n_act].long()
+            out_inds = indice_pairs[i, 1, :n_act].long()
 
         # gather input features
         inp_gathered = features[inp_inds]  # [n_act, C_in]
@@ -534,7 +726,7 @@ def indice_conv(features: torch.Tensor,
             gemm_out = gemm_out.to(out_features.dtype)
         out_features.index_add_(0, out_inds, gemm_out)
 
-    return out_features
+    return _cast_output_for_autocast(out_features, features, filters)
 
 
 def indice_conv_backward(features: torch.Tensor,
@@ -555,11 +747,13 @@ def indice_conv_backward(features: torch.Tensor,
     hip = _get_hip_module()
     if hip is not None and features.is_cuda:
         return hip.indice_conv_backward(
-            features, filters, out_bp, indice_pairs, indice_pair_num, subm)
+            features, filters, out_bp, indice_pairs, indice_pair_num,
+            inverse, subm)
 
     kv = filters.shape[0]
     c_in = features.shape[1]
     c_out = filters.shape[2]
+    center = kv // 2
     n_in = features.shape[0]
     device = features.device
     dtype = features.dtype
@@ -572,8 +766,17 @@ def indice_conv_backward(features: torch.Tensor,
         if n_act == 0:
             continue
 
-        inp_inds = indice_pairs[i, 0, :n_act].long()
-        out_inds = indice_pairs[i, 1, :n_act].long()
+        if subm and (not inverse) and i == center:
+            dfilters[i] = _gemm(features.t(), out_bp)
+            din = din + _gemm(out_bp, filters[i].t())
+            continue
+
+        if inverse:
+            inp_inds = indice_pairs[i, 1, :n_act].long()
+            out_inds = indice_pairs[i, 0, :n_act].long()
+        else:
+            inp_inds = indice_pairs[i, 0, :n_act].long()
+            out_inds = indice_pairs[i, 1, :n_act].long()
 
         # gather
         inp_gathered = features[inp_inds]  # [n_act, C_in]

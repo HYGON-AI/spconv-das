@@ -68,6 +68,13 @@ class IndiceData(object):
         self.spatial_shape = spatial_shape
         self.is_subm = is_subm
         self.algo = algo
+        # Optional metadata used by inverse conv / validation.
+        self.out_indices = kwargs.get("out_indices", indices)
+        self.out_spatial_shape = kwargs.get("out_spatial_shape", spatial_shape)
+        self.ksize = kwargs.get("ksize", None)
+        self.stride = kwargs.get("stride", None)
+        self.padding = kwargs.get("padding", None)
+        self.dilation = kwargs.get("dilation", None)
 
 
 class ImplicitGemmIndiceData(object):

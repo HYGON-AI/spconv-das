@@ -1,7 +1,12 @@
 #include <torch/extension.h>
+#include <cstdlib>
+#include <cstdint>
 #include <hip/hip_runtime.h>
 #include <vector>
+#include <algorithm>
+#include <string>
 #include <ATen/cuda/CUDAContext.h>
+#include <ATen/hip/HIPBlas.h>
 
 namespace spconv_hip {
 
@@ -20,7 +25,482 @@ int generate_conv_inds(
     const int* ksize_h, const int* stride_h, const int* padding_h,
     const int* dilation_h, int ndim, bool transposed, hipStream_t stream);
 
+template <typename IndexT>
+void build_indice_conv_lut(
+    const IndexT* indice_pairs,
+    const int* indice_num_per_loc,
+    int* lut,
+    int* dup_slots,
+    int* dup_inp,
+    int* dup_count_dev,
+    int dup_capacity,
+    int num_out,
+    int kv,
+    int nmax,
+    int gather_axis,
+    int scatter_axis,
+    bool skip_center,
+    hipStream_t stream);
+
+template <typename IndexT>
+void build_indice_conv_lut_epoch(
+    const IndexT* indice_pairs,
+    const int* indice_num_per_loc,
+    std::int64_t* lut_state,
+    int* dup_slots,
+    int* dup_inp,
+    int* dup_count_dev,
+    int dup_capacity,
+    int kv,
+    int nmax,
+    int gather_axis,
+    int scatter_axis,
+    bool skip_center,
+    unsigned int lut_epoch,
+    hipStream_t stream);
+
+void launch_indice_conv_forward_fused_f32(
+    const float* features,
+    const float* filters,
+    const int* lut,
+    const std::int64_t* lut_state,
+    float* out,
+    int num_out,
+    int kv,
+    int c_in,
+    int c_out,
+    unsigned int lut_epoch,
+    bool accumulate_existing,
+    bool filters_transposed,
+    hipStream_t stream);
+
+void launch_indice_conv_accumulate_duplicates_f32(
+    const float* features,
+    const float* filters,
+    const int* dup_slots,
+    const int* dup_inp,
+    const int* dup_count_dev,
+    int dup_capacity,
+    float* out,
+    int kv,
+    int c_in,
+    int c_out,
+    bool filters_transposed,
+    hipStream_t stream);
+
+template <typename IndexT>
+void launch_indice_conv_dfilters_f32(
+    const float* features,
+    const float* out_bp,
+    const IndexT* indice_pairs,
+    const int* indice_num_per_loc,
+    float* dfilters,
+    int kv,
+    int c_in,
+    int c_out,
+    int nmax,
+    int gather_axis,
+    int scatter_axis,
+    hipStream_t stream);
+
+template <typename IndexT, typename FlatIndexT>
+void launch_flatten_indice_pairs_rows(
+    const IndexT* indice_pairs,
+    const int* window_ks,
+    const int* seg_offsets,
+    int num_segs,
+    int nmax,
+    int gather_axis,
+    int scatter_axis,
+    FlatIndexT* flat_inp,
+    FlatIndexT* flat_out,
+    int total_nhot,
+    hipStream_t stream);
+
 }  // namespace spconv_hip
+
+namespace {
+
+struct IndiceConvWorkspace {
+    torch::Tensor fused_lut;
+    torch::Tensor fused_lut_state;
+    torch::Tensor fused_dup_slots;
+    torch::Tensor fused_dup_inp;
+    torch::Tensor fused_dup_count;
+    torch::Tensor grouped_feat_pack;
+    torch::Tensor grouped_out_pack;
+    torch::Tensor grouped_out_bp_pack;
+    torch::Tensor grouped_flat_inp;
+    torch::Tensor grouped_flat_out;
+    torch::Tensor grouped_ks_dev;
+    torch::Tensor grouped_offsets_dev;
+    torch::Tensor host_indice_pair_num;
+    torch::Tensor dinput_filters_t;
+    unsigned int fused_lut_epoch = 1;
+};
+
+thread_local std::vector<IndiceConvWorkspace> g_workspaces;
+
+IndiceConvWorkspace& get_workspace(const c10::Device& device) {
+    TORCH_CHECK(device.is_cuda(), "workspace device must be CUDA/HIP");
+    const int index = device.index();
+    TORCH_CHECK(index >= 0, "workspace device index must be non-negative");
+    if (static_cast<int>(g_workspaces.size()) <= index) {
+        g_workspaces.resize(index + 1);
+    }
+    return g_workspaces[index];
+}
+
+bool tensor_matches(const torch::Tensor& tensor,
+                    const c10::Device& device,
+                    c10::ScalarType dtype) {
+    return tensor.defined() &&
+           tensor.device() == device &&
+           tensor.scalar_type() == dtype &&
+           tensor.is_contiguous();
+}
+
+bool host_tensor_matches(const torch::Tensor& tensor,
+                         c10::ScalarType dtype) {
+    return tensor.defined() &&
+           tensor.device().is_cpu() &&
+           tensor.scalar_type() == dtype &&
+           tensor.is_contiguous() &&
+           tensor.is_pinned();
+}
+
+torch::Tensor ensure_buffer(torch::Tensor& cache,
+                            int64_t numel,
+                            const c10::Device& device,
+                            c10::ScalarType dtype,
+                            const char* name) {
+    TORCH_CHECK(numel >= 0, name, " numel must be non-negative");
+    if (numel == 0) {
+        return torch::empty({0}, torch::TensorOptions().device(device).dtype(dtype));
+    }
+    if (!tensor_matches(cache, device, dtype) || cache.numel() < numel) {
+        cache = torch::empty({numel}, torch::TensorOptions().device(device).dtype(dtype));
+    }
+    return cache.narrow(0, 0, numel);
+}
+
+torch::Tensor ensure_host_buffer(torch::Tensor& cache,
+                                 int64_t numel,
+                                 c10::ScalarType dtype,
+                                 const char* name) {
+    TORCH_CHECK(numel >= 0, name, " numel must be non-negative");
+    if (numel == 0) {
+        return torch::empty({0}, torch::TensorOptions().device(torch::kCPU).dtype(dtype));
+    }
+    if (!host_tensor_matches(cache, dtype) || cache.numel() < numel) {
+        cache = torch::empty(
+            {numel},
+            torch::TensorOptions().device(torch::kCPU).dtype(dtype).pinned_memory(true));
+    }
+    return cache.narrow(0, 0, numel);
+}
+
+torch::Tensor ensure_matrix(torch::Tensor& cache,
+                            int64_t rows,
+                            int64_t cols,
+                            const c10::Device& device,
+                            c10::ScalarType dtype,
+                            const char* name) {
+    TORCH_CHECK(rows >= 0 && cols >= 0, name, " shape must be non-negative");
+    auto flat = ensure_buffer(cache, rows * cols, device, dtype, name);
+    return flat.view({rows, cols});
+}
+
+torch::Tensor indice_conv_forward_grouped_blas(
+    torch::Tensor features,
+    torch::Tensor filters,
+    torch::Tensor indice_pairs,
+    torch::Tensor indice_pair_num,
+    int64_t num_activate_out,
+    bool inverse,
+    bool subm,
+    bool filters_transposed) {
+    TORCH_CHECK(features.scalar_type() == torch::kFloat32,
+                "grouped forward only supports float32 features");
+    TORCH_CHECK(filters.scalar_type() == torch::kFloat32,
+                "grouped forward only supports float32 filters");
+    TORCH_CHECK(!filters_transposed,
+                "grouped forward does not support filters_transposed");
+
+    int kv = filters.size(0);
+    int c_in = features.size(1);
+    int c_out = filters.size(2);
+    int nmax = indice_pairs.size(2);
+    int gather_axis = inverse ? 1 : 0;
+    int scatter_axis = inverse ? 0 : 1;
+    int center = kv / 2;
+    bool pair_is_long = indice_pairs.scalar_type() == torch::kLong;
+
+    bool has_center_accum = subm && !inverse;
+    bool track_grad = features.requires_grad() || filters.requires_grad();
+    auto out_features = has_center_accum
+        ? torch::empty({num_activate_out, c_out}, features.options())
+        : torch::zeros({num_activate_out, c_out}, features.options());
+    if (has_center_accum) {
+        auto center_out = track_grad
+            ? at::mm(features, filters.select(0, center))
+            : out_features;
+        if (!track_grad) {
+            at::mm_out(out_features, features, filters.select(0, center));
+        } else {
+            out_features.copy_(center_out);
+        }
+    }
+
+    auto& workspace = get_workspace(features.device());
+    auto pn_host = ensure_host_buffer(
+        workspace.host_indice_pair_num, kv, torch::kInt32, "host_indice_pair_num");
+    auto* pn = pn_host.data_ptr<int>();
+    hipStream_t stream = (hipStream_t)at::cuda::getCurrentCUDAStream().stream();
+    hipError_t pn_status = hipMemcpyAsync(
+        pn,
+        indice_pair_num.data_ptr<int>(),
+        kv * sizeof(int),
+        hipMemcpyDeviceToHost,
+        stream);
+    TORCH_CHECK(pn_status == hipSuccess,
+                "hipMemcpyAsync indice_pair_num failed: ",
+                hipGetErrorString(pn_status));
+    hipError_t pn_sync_status = hipStreamSynchronize(stream);
+    TORCH_CHECK(pn_sync_status == hipSuccess,
+                "hipStreamSynchronize indice_pair_num failed: ",
+                hipGetErrorString(pn_sync_status));
+
+    std::vector<int> active_ks;
+    active_ks.reserve(kv);
+    for (int i = 0; i < kv; ++i) {
+        if (pn[i] == 0) {
+            continue;
+        }
+        if (subm && !inverse && i == center) {
+            continue;
+        }
+        active_ks.push_back(i);
+    }
+    if (active_ks.empty()) {
+        return out_features;
+    }
+    std::sort(active_ks.begin(), active_ks.end(),
+              [&](int a, int b) { return pn[a] < pn[b]; });
+
+    hipblasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
+    at::cuda::blas::PointerModeGuard pointer_mode_guard(handle, HIPBLAS_POINTER_MODE_HOST);
+    int64_t kWindowNhotCap = 1500000;
+    if (const char* env = std::getenv("SPCONV_GROUPED_FORWARD_NHOT_CAP")) {
+        long long parsed = std::atoll(env);
+        if (parsed > 0) {
+            kWindowNhotCap = parsed;
+        }
+    }
+    size_t free_bytes = 0;
+    size_t total_bytes = 0;
+    if (hipMemGetInfo(&free_bytes, &total_bytes) == hipSuccess) {
+        constexpr size_t kReserveBytes = 256ull << 20;
+        if (free_bytes > kReserveBytes) {
+            size_t bytes_per_nhot =
+                ((size_t)(c_in + c_out) * sizeof(float) + 2 * sizeof(int64_t)) * 5 / 4;
+            int64_t free_cap = static_cast<int64_t>((free_bytes - kReserveBytes) /
+                                                    std::max<size_t>(bytes_per_nhot, 1));
+            if (free_cap > 0) {
+                kWindowNhotCap = std::min(kWindowNhotCap, free_cap);
+            }
+        }
+    }
+    kWindowNhotCap = std::max<int64_t>(kWindowNhotCap, 200000);
+    int64_t total_active_nhot = 0;
+    for (int i : active_ks) {
+        total_active_nhot += pn[i];
+    }
+    int64_t pack_cap = std::min<int64_t>(kWindowNhotCap, total_active_nhot);
+    auto feat_pack_storage = ensure_buffer(
+        workspace.grouped_feat_pack, pack_cap * c_in,
+        features.device(), features.scalar_type(), "grouped_feat_pack");
+    auto out_pack_storage = ensure_buffer(
+        workspace.grouped_out_pack, pack_cap * c_out,
+        out_features.device(), out_features.scalar_type(), "grouped_out_pack");
+    auto pair_index_dtype = pair_is_long ? torch::kInt64 : torch::kInt32;
+    auto flat_inp_storage = ensure_buffer(
+        workspace.grouped_flat_inp, pack_cap,
+        features.device(), pair_index_dtype, "grouped_flat_inp");
+    auto flat_out_storage = ensure_buffer(
+        workspace.grouped_flat_out, pack_cap,
+        features.device(), pair_index_dtype, "grouped_flat_out");
+    auto ks_dev_storage = ensure_buffer(
+        workspace.grouped_ks_dev, active_ks.size(),
+        features.device(), torch::kInt32, "grouped_ks_dev");
+    auto offsets_dev_storage = ensure_buffer(
+        workspace.grouped_offsets_dev, active_ks.size() + 1,
+        features.device(), torch::kInt32, "grouped_offsets_dev");
+
+    size_t begin = 0;
+    while (begin < active_ks.size()) {
+        size_t end = begin;
+        int64_t window_nhot = 0;
+        while (end < active_ks.size()) {
+            int nhot = pn[active_ks[end]];
+            if (window_nhot > 0 && window_nhot + nhot > kWindowNhotCap) {
+                break;
+            }
+            window_nhot += nhot;
+            ++end;
+        }
+
+        auto feat_pack = feat_pack_storage.narrow(0, 0, window_nhot * c_in)
+            .view({window_nhot, c_in});
+        auto out_pack = out_pack_storage.narrow(0, 0, window_nhot * c_out)
+            .view({window_nhot, c_out});
+
+        std::vector<hipblasOperation_t> transa_array;
+        std::vector<hipblasOperation_t> transb_array;
+        std::vector<int> m_array;
+        std::vector<int> n_array;
+        std::vector<int> k_array;
+        std::vector<float> alpha_array;
+        std::vector<const float*> a_array;
+        std::vector<int> lda_array;
+        std::vector<const float*> b_array;
+        std::vector<int> ldb_array;
+        std::vector<float> beta_array;
+        std::vector<float*> c_array;
+        std::vector<int> ldc_array;
+        std::vector<int> group_size;
+        size_t max_groups = end - begin;
+        size_t group_count = 0;
+        transa_array.reserve(max_groups);
+        transb_array.reserve(max_groups);
+        m_array.reserve(max_groups);
+        n_array.reserve(max_groups);
+        k_array.reserve(max_groups);
+        alpha_array.reserve(max_groups);
+        a_array.reserve(max_groups);
+        lda_array.reserve(max_groups);
+        b_array.reserve(max_groups);
+        ldb_array.reserve(max_groups);
+        beta_array.reserve(max_groups);
+        c_array.reserve(max_groups);
+        ldc_array.reserve(max_groups);
+        group_size.reserve(max_groups);
+        std::vector<int> window_ks_host;
+        std::vector<int> seg_offsets_host;
+        window_ks_host.reserve(max_groups);
+        seg_offsets_host.reserve(max_groups + 1);
+        seg_offsets_host.push_back(0);
+
+        int64_t offset = 0;
+        int prev_nhot = -1;
+        for (size_t idx = begin; idx < end; ++idx) {
+            int i = active_ks[idx];
+            int nhot = pn[i];
+            window_ks_host.push_back(i);
+            seg_offsets_host.push_back(static_cast<int>(offset + nhot));
+            auto w = filters.select(0, i);
+            a_array.push_back(w.data_ptr<float>());
+            b_array.push_back(feat_pack.data_ptr<float>() + offset * c_in);
+            c_array.push_back(out_pack.data_ptr<float>() + offset * c_out);
+            if (nhot != prev_nhot) {
+                transa_array.push_back(HIPBLAS_OP_N);
+                transb_array.push_back(HIPBLAS_OP_N);
+                m_array.push_back(c_out);
+                n_array.push_back(nhot);
+                k_array.push_back(c_in);
+                alpha_array.push_back(1.0f);
+                lda_array.push_back(c_out);
+                ldb_array.push_back(c_in);
+                beta_array.push_back(0.0f);
+                ldc_array.push_back(c_out);
+                group_size.push_back(1);
+                prev_nhot = nhot;
+                ++group_count;
+            } else {
+                ++group_size.back();
+            }
+            offset += nhot;
+        }
+
+        auto ks_dev = ks_dev_storage.narrow(0, 0, window_ks_host.size());
+        auto offsets_dev = offsets_dev_storage.narrow(0, 0, seg_offsets_host.size());
+        hipError_t ks_status = hipMemcpyAsync(
+            ks_dev.data_ptr<int>(),
+            window_ks_host.data(),
+            window_ks_host.size() * sizeof(int),
+            hipMemcpyHostToDevice,
+            stream);
+        TORCH_CHECK(ks_status == hipSuccess,
+                    "hipMemcpyAsync ks_dev failed: ",
+                    hipGetErrorString(ks_status));
+        hipError_t offsets_status = hipMemcpyAsync(
+            offsets_dev.data_ptr<int>(),
+            seg_offsets_host.data(),
+            seg_offsets_host.size() * sizeof(int),
+            hipMemcpyHostToDevice,
+            stream);
+        TORCH_CHECK(offsets_status == hipSuccess,
+                    "hipMemcpyAsync offsets_dev failed: ",
+                    hipGetErrorString(offsets_status));
+        auto flat_inp = flat_inp_storage.narrow(0, 0, window_nhot);
+        auto flat_out = flat_out_storage.narrow(0, 0, window_nhot);
+        if (pair_is_long) {
+            spconv_hip::launch_flatten_indice_pairs_rows<int64_t, int64_t>(
+                indice_pairs.data_ptr<int64_t>(),
+                ks_dev.data_ptr<int>(),
+                offsets_dev.data_ptr<int>(),
+                static_cast<int>(window_ks_host.size()),
+                nmax,
+                gather_axis,
+                scatter_axis,
+                flat_inp.data_ptr<int64_t>(),
+                flat_out.data_ptr<int64_t>(),
+                static_cast<int>(window_nhot),
+                stream);
+        } else {
+            spconv_hip::launch_flatten_indice_pairs_rows<int, int>(
+                indice_pairs.data_ptr<int>(),
+                ks_dev.data_ptr<int>(),
+                offsets_dev.data_ptr<int>(),
+                static_cast<int>(window_ks_host.size()),
+                nmax,
+                gather_axis,
+                scatter_axis,
+                flat_inp.data_ptr<int>(),
+                flat_out.data_ptr<int>(),
+                static_cast<int>(window_nhot),
+                stream);
+        }
+
+        at::index_select_out(feat_pack, features, 0, flat_inp);
+        hipblasStatus_t status = hipblasSgemmGroupedBatched(
+            handle,
+            transa_array.data(),
+            transb_array.data(),
+            m_array.data(),
+            n_array.data(),
+            k_array.data(),
+            alpha_array.data(),
+            a_array.data(),
+            lda_array.data(),
+            b_array.data(),
+            ldb_array.data(),
+            beta_array.data(),
+            c_array.data(),
+            ldc_array.data(),
+            static_cast<int>(group_count),
+            group_size.data());
+        TORCH_CHECK(status == HIPBLAS_STATUS_SUCCESS,
+                    "hipblasSgemmGroupedBatched forward failed with status ",
+                    static_cast<int>(status));
+        out_features.index_add_(0, flat_out, out_pack);
+        begin = end;
+    }
+
+    return out_features;
+}
+
+}  // namespace
 
 // Check whether the spatial volume fits in int32.
 static bool check_use_int32(const std::vector<int>& spatial_shape, int batch_size) {
@@ -144,34 +624,283 @@ torch::Tensor indice_conv_forward(
     torch::Tensor indice_pairs,     // [kv, 2, N_max]
     torch::Tensor indice_pair_num,  // [kv]
     int64_t num_activate_out,
-    bool subm)
+    bool inverse,
+    bool subm,
+    bool filters_transposed = false)
 {
     int kv = filters.size(0);
-    int c_out = filters.size(2);
+    int c_in = features.size(1);
+    int c_out = filters_transposed ? filters.size(1) : filters.size(2);
+    TORCH_CHECK(c_in == (filters_transposed ? filters.size(2) : filters.size(1)),
+                "filter channel shape mismatch");
+    int gather_axis = inverse ? 1 : 0;
+    int scatter_axis = inverse ? 0 : 1;
+    int center = kv / 2;
+    bool pair_is_long = indice_pairs.scalar_type() == torch::kLong;
+    bool track_grad = features.requires_grad() || filters.requires_grad();
 
-    auto out_features = torch::zeros({num_activate_out, c_out},
-        features.options());
+    bool has_center_accum = subm && !inverse;
+    auto out_features = has_center_accum
+        ? torch::empty({num_activate_out, c_out}, features.options())
+        : torch::zeros({num_activate_out, c_out}, features.options());
+    if (has_center_accum) {
+        auto center_filter = filters.select(0, center);
+        if (filters_transposed) {
+            center_filter = center_filter.transpose(0, 1);
+        }
+        if (track_grad) {
+            out_features.copy_(at::mm(features, center_filter));
+        } else {
+            at::mm_out(out_features, features, center_filter);
+        }
+    }
 
     // 1 sync instead of kv syncs: copy pair counts to CPU
-    auto pn_cpu = indice_pair_num.to(torch::kCPU, torch::kInt32);
-    auto* pn = pn_cpu.data_ptr<int>();
+    auto& workspace = get_workspace(features.device());
+    auto pn_host = ensure_host_buffer(
+        workspace.host_indice_pair_num, kv, torch::kInt32, "host_indice_pair_num");
+    auto* pn = pn_host.data_ptr<int>();
+    hipStream_t stream = (hipStream_t)at::cuda::getCurrentCUDAStream().stream();
+    hipError_t pn_status = hipMemcpyAsync(
+        pn,
+        indice_pair_num.data_ptr<int>(),
+        kv * sizeof(int),
+        hipMemcpyDeviceToHost,
+        stream);
+    TORCH_CHECK(pn_status == hipSuccess,
+                "hipMemcpyAsync indice_pair_num failed: ",
+                hipGetErrorString(pn_status));
+    hipError_t pn_sync_status = hipStreamSynchronize(stream);
+    TORCH_CHECK(pn_sync_status == hipSuccess,
+                "hipStreamSynchronize indice_pair_num failed: ",
+                hipGetErrorString(pn_sync_status));
+    int max_nhot = 0;
+    for (int i = 0; i < kv; ++i) {
+        if (pn[i] > max_nhot) max_nhot = pn[i];
+    }
+    auto feat_scratch = (!track_grad && max_nhot > 0)
+        ? torch::empty({max_nhot, c_in}, features.options())
+        : torch::Tensor();
+    auto gemm_scratch = (!track_grad && max_nhot > 0)
+        ? torch::empty({max_nhot, c_out}, out_features.options())
+        : torch::Tensor();
 
     for (int i = 0; i < kv; ++i) {
         int nhot = pn[i];
         if (nhot == 0) continue;
 
-        auto inp_inds = indice_pairs.select(0, i).select(0, 0).slice(0, 0, nhot).to(torch::kLong);
-        auto out_inds = indice_pairs.select(0, i).select(0, 1).slice(0, 0, nhot).to(torch::kLong);
+        if (has_center_accum && i == center) {
+            continue;
+        }
 
-        auto inp_gathered = features.index_select(0, inp_inds);  // [nhot, C_in]
+        auto pair = indice_pairs.select(0, i);
+        auto inp_inds = pair.select(0, gather_axis).slice(0, 0, nhot);
+        auto out_inds = pair.select(0, scatter_axis).slice(0, 0, nhot);
+
+        torch::Tensor inp_gathered;
+        if (track_grad) {
+            inp_gathered = features.index_select(0, inp_inds);  // [nhot, C_in]
+        } else {
+            inp_gathered = feat_scratch.slice(0, 0, nhot);
+            at::index_select_out(inp_gathered, features, 0, inp_inds);  // [nhot, C_in]
+        }
         auto w = filters.select(0, i);                           // [C_in, C_out]
-        auto result = at::mm(inp_gathered, w);                   // [nhot, C_out]
+        if (filters_transposed) {
+            w = w.transpose(0, 1);
+        }
+        torch::Tensor result;
+        if (track_grad) {
+            result = at::mm(inp_gathered, w);                    // [nhot, C_out]
+        } else {
+            result = gemm_scratch.slice(0, 0, nhot);
+            at::mm_out(result, inp_gathered, w);                 // [nhot, C_out]
+        }
 
         if (result.dtype() != out_features.dtype()) {
             result = result.to(out_features.dtype());
         }
         out_features.index_add_(0, out_inds, result);
     }
+
+    return out_features;
+}
+
+torch::Tensor indice_conv_forward_fused(
+    torch::Tensor features,         // [N_in, C_in]
+    torch::Tensor filters,          // [kv, C_in, C_out]
+    torch::Tensor indice_pairs,     // [kv, 2, N_max]
+    torch::Tensor indice_pair_num,  // [kv]
+    int64_t num_activate_out,
+    bool inverse,
+    bool subm,
+    bool filters_transposed = false)
+{
+    TORCH_CHECK(features.is_cuda(), "features must be on GPU");
+    TORCH_CHECK(filters.is_cuda(), "filters must be on GPU");
+    TORCH_CHECK(indice_pairs.is_cuda(), "indice_pairs must be on GPU");
+    TORCH_CHECK(indice_pair_num.is_cuda(), "indice_pair_num must be on GPU");
+    TORCH_CHECK(features.scalar_type() == torch::kFloat32,
+                "fused indice_conv forward currently supports float32 only");
+    TORCH_CHECK(filters.scalar_type() == torch::kFloat32,
+                "fused indice_conv forward currently supports float32 filters only");
+    TORCH_CHECK(features.is_contiguous(), "features must be contiguous");
+    TORCH_CHECK(filters.is_contiguous(), "filters must be contiguous");
+    TORCH_CHECK(indice_pairs.is_contiguous(), "indice_pairs must be contiguous");
+    TORCH_CHECK(indice_pair_num.scalar_type() == torch::kInt32,
+                "indice_pair_num must be int32");
+
+    int kv = filters.size(0);
+    int c_in = features.size(1);
+    int c_out = filters_transposed ? filters.size(1) : filters.size(2);
+    TORCH_CHECK(c_in == (filters_transposed ? filters.size(2) : filters.size(1)),
+                "filter channel shape mismatch");
+    int nmax = indice_pairs.size(2);
+    int gather_axis = inverse ? 1 : 0;
+    int scatter_axis = inverse ? 0 : 1;
+    bool skip_center = subm && !inverse;
+    auto& workspace = get_workspace(features.device());
+
+    bool use_epoch_lut = false;
+    if (const char* env = std::getenv("SPCONV_USE_EPOCH_LUT")) {
+        use_epoch_lut = std::atoi(env) != 0;
+    }
+    torch::Tensor lut;
+    torch::Tensor lut_state;
+    unsigned int lut_epoch = 0;
+    if (use_epoch_lut) {
+        lut_state = ensure_matrix(
+            workspace.fused_lut_state, num_activate_out, kv,
+            features.device(), torch::kInt64, "fused_lut_state");
+        lut_epoch = workspace.fused_lut_epoch++;
+        if (workspace.fused_lut_epoch == 0) {
+            workspace.fused_lut_epoch = 1;
+        }
+    } else {
+        lut = ensure_matrix(
+            workspace.fused_lut, num_activate_out, kv,
+            features.device(), torch::kInt32, "fused_lut");
+    }
+    int64_t dup_capacity = static_cast<int64_t>(kv) * nmax;
+    auto dup_slots = ensure_buffer(
+        workspace.fused_dup_slots, dup_capacity,
+        features.device(), torch::kInt32, "fused_dup_slots");
+    auto dup_inp = ensure_buffer(
+        workspace.fused_dup_inp, dup_capacity,
+        features.device(), torch::kInt32, "fused_dup_inp");
+    auto dup_count_dev = ensure_buffer(
+        workspace.fused_dup_count, 1,
+        features.device(), torch::kInt32, "fused_dup_count");
+    hipStream_t stream = (hipStream_t)at::cuda::getCurrentCUDAStream().stream();
+
+    if (indice_pairs.scalar_type() == torch::kLong) {
+        if (use_epoch_lut) {
+            spconv_hip::build_indice_conv_lut_epoch<int64_t>(
+                indice_pairs.data_ptr<int64_t>(),
+                indice_pair_num.data_ptr<int>(),
+                lut_state.data_ptr<std::int64_t>(),
+                dup_slots.data_ptr<int>(),
+                dup_inp.data_ptr<int>(),
+                dup_count_dev.data_ptr<int>(),
+                static_cast<int>(dup_capacity),
+                kv,
+                nmax,
+                gather_axis,
+                scatter_axis,
+                skip_center,
+                lut_epoch,
+                stream);
+        } else {
+            spconv_hip::build_indice_conv_lut<int64_t>(
+                indice_pairs.data_ptr<int64_t>(),
+                indice_pair_num.data_ptr<int>(),
+                lut.data_ptr<int>(),
+                dup_slots.data_ptr<int>(),
+                dup_inp.data_ptr<int>(),
+                dup_count_dev.data_ptr<int>(),
+                static_cast<int>(dup_capacity),
+                num_activate_out,
+                kv,
+                nmax,
+                gather_axis,
+                scatter_axis,
+                skip_center,
+                stream);
+        }
+    } else if (indice_pairs.scalar_type() == torch::kInt32) {
+        if (use_epoch_lut) {
+            spconv_hip::build_indice_conv_lut_epoch<int>(
+                indice_pairs.data_ptr<int>(),
+                indice_pair_num.data_ptr<int>(),
+                lut_state.data_ptr<std::int64_t>(),
+                dup_slots.data_ptr<int>(),
+                dup_inp.data_ptr<int>(),
+                dup_count_dev.data_ptr<int>(),
+                static_cast<int>(dup_capacity),
+                kv,
+                nmax,
+                gather_axis,
+                scatter_axis,
+                skip_center,
+                lut_epoch,
+                stream);
+        } else {
+            spconv_hip::build_indice_conv_lut<int>(
+                indice_pairs.data_ptr<int>(),
+                indice_pair_num.data_ptr<int>(),
+                lut.data_ptr<int>(),
+                dup_slots.data_ptr<int>(),
+                dup_inp.data_ptr<int>(),
+                dup_count_dev.data_ptr<int>(),
+                static_cast<int>(dup_capacity),
+                num_activate_out,
+                kv,
+                nmax,
+                gather_axis,
+                scatter_axis,
+                skip_center,
+                stream);
+        }
+    } else {
+        TORCH_CHECK(false, "indice_pairs must be int32 or int64");
+    }
+
+    auto out_features = torch::empty({num_activate_out, c_out}, features.options());
+    if (skip_center) {
+        int center = kv / 2;
+        auto center_filter = filters.select(0, center);
+        if (filters_transposed) {
+            center_filter = center_filter.transpose(0, 1);
+        }
+        at::mm_out(out_features, features, center_filter);
+    }
+
+    spconv_hip::launch_indice_conv_forward_fused_f32(
+        features.data_ptr<float>(),
+        filters.data_ptr<float>(),
+        use_epoch_lut ? nullptr : lut.data_ptr<int>(),
+        use_epoch_lut ? lut_state.data_ptr<std::int64_t>() : nullptr,
+        out_features.data_ptr<float>(),
+        num_activate_out,
+        kv,
+        c_in,
+        c_out,
+        lut_epoch,
+        skip_center,
+        filters_transposed,
+        stream);
+    spconv_hip::launch_indice_conv_accumulate_duplicates_f32(
+        features.data_ptr<float>(),
+        filters.data_ptr<float>(),
+        dup_slots.data_ptr<int>(),
+        dup_inp.data_ptr<int>(),
+        dup_count_dev.data_ptr<int>(),
+        static_cast<int>(dup_capacity),
+        out_features.data_ptr<float>(),
+        kv,
+        c_in,
+        c_out,
+        filters_transposed,
+        stream);
 
     return out_features;
 }
@@ -185,35 +914,403 @@ std::vector<torch::Tensor> indice_conv_backward(
     torch::Tensor out_bp,           // [N_out, C_out]
     torch::Tensor indice_pairs,     // [kv, 2, N_max]
     torch::Tensor indice_pair_num,  // [kv]
+    bool inverse,
     bool subm)
 {
     int kv = filters.size(0);
     int c_in = features.size(1);
+    int c_out = out_bp.size(1);
     int n_in = features.size(0);
+    int nmax = indice_pairs.size(2);
+    int gather_axis = inverse ? 1 : 0;
+    int scatter_axis = inverse ? 0 : 1;
+    int center = kv / 2;
+    bool pair_is_long = indice_pairs.scalar_type() == torch::kLong;
 
-    auto din = torch::zeros({n_in, c_in}, features.options());
-    auto dfilters = torch::zeros_like(filters);
+    auto out_bp_contig = out_bp.contiguous();
+    auto& workspace = get_workspace(features.device());
+    bool use_direct_din = false;
+    if (const char* env = std::getenv("SPCONV_DIRECT_DINPUT_TRANSPOSE")) {
+        use_direct_din = std::atoi(env) != 0;
+    }
+    bool use_fused_dinput =
+        out_bp_contig.scalar_type() == torch::kFloat32 &&
+        filters.scalar_type() == torch::kFloat32;
+    if (const char* env = std::getenv("SPCONV_USE_FUSED_DINPUT")) {
+        use_fused_dinput = std::atoi(env) != 0;
+    }
+    bool cache_dinput_filters_t = true;
+    if (const char* env = std::getenv("SPCONV_CACHE_DINPUT_FILTERS_T")) {
+        cache_dinput_filters_t = std::atoi(env) != 0;
+    }
+    torch::Tensor din;
+    if (use_direct_din) {
+        din = use_fused_dinput
+            ? indice_conv_forward_fused(
+                out_bp_contig, filters, indice_pairs, indice_pair_num,
+                n_in, !inverse, subm, true)
+            : indice_conv_forward(
+                out_bp_contig, filters, indice_pairs, indice_pair_num,
+                n_in, !inverse, subm, true);
+    } else {
+        auto filters_t_view = filters.transpose(1, 2);
+        torch::Tensor filters_t;
+        if (cache_dinput_filters_t) {
+            auto filters_t_storage = ensure_buffer(
+                workspace.dinput_filters_t,
+                static_cast<int64_t>(kv) * c_out * c_in,
+                filters.device(),
+                filters.scalar_type(),
+                "dinput_filters_t");
+            filters_t = filters_t_storage.view({kv, c_out, c_in});
+            filters_t.copy_(filters_t_view);
+        } else {
+            filters_t = filters_t_view.contiguous();
+        }
+        din = (use_fused_dinput &&
+               filters_t.scalar_type() == torch::kFloat32)
+            ? indice_conv_forward_fused(
+                out_bp_contig, filters_t, indice_pairs, indice_pair_num,
+                n_in, !inverse, subm)
+            : indice_conv_forward(
+                  out_bp_contig, filters_t, indice_pairs, indice_pair_num,
+                  n_in, !inverse, subm);
+    }
+    bool use_fused_dfilters =
+        features.scalar_type() == torch::kFloat32 &&
+        out_bp_contig.scalar_type() == torch::kFloat32 &&
+        filters.scalar_type() == torch::kFloat32 &&
+        (indice_pairs.scalar_type() == torch::kLong ||
+         indice_pairs.scalar_type() == torch::kInt32);
+    if (const char* env = std::getenv("SPCONV_USE_FUSED_DFILTERS")) {
+        use_fused_dfilters = std::atoi(env) != 0;
+    }
+    auto dfilters = use_fused_dfilters ? torch::empty_like(filters)
+                                       : torch::zeros_like(filters);
+    if (use_fused_dfilters) {
+        hipStream_t stream = (hipStream_t)at::cuda::getCurrentCUDAStream().stream();
+        if (indice_pairs.scalar_type() == torch::kLong) {
+            spconv_hip::launch_indice_conv_dfilters_f32<int64_t>(
+                features.data_ptr<float>(),
+                out_bp_contig.data_ptr<float>(),
+                indice_pairs.data_ptr<int64_t>(),
+                indice_pair_num.data_ptr<int>(),
+                dfilters.data_ptr<float>(),
+                kv,
+                c_in,
+                c_out,
+                nmax,
+                gather_axis,
+                scatter_axis,
+                stream);
+        } else if (indice_pairs.scalar_type() == torch::kInt32) {
+            spconv_hip::launch_indice_conv_dfilters_f32<int>(
+                features.data_ptr<float>(),
+                out_bp_contig.data_ptr<float>(),
+                indice_pairs.data_ptr<int>(),
+                indice_pair_num.data_ptr<int>(),
+                dfilters.data_ptr<float>(),
+                kv,
+                c_in,
+                c_out,
+                nmax,
+                gather_axis,
+                scatter_axis,
+                stream);
+        } else {
+            use_fused_dfilters = false;
+        }
+    }
+    if (use_fused_dfilters) {
+        return {din, dfilters};
+    }
 
-    auto pn_cpu = indice_pair_num.to(torch::kCPU, torch::kInt32);
-    auto* pn = pn_cpu.data_ptr<int>();
+    auto pn_host = ensure_host_buffer(
+        workspace.host_indice_pair_num, kv, torch::kInt32, "host_indice_pair_num");
+    auto* pn = pn_host.data_ptr<int>();
+    hipStream_t stream = (hipStream_t)at::cuda::getCurrentCUDAStream().stream();
+    hipError_t pn_status = hipMemcpyAsync(
+        pn,
+        indice_pair_num.data_ptr<int>(),
+        kv * sizeof(int),
+        hipMemcpyDeviceToHost,
+        stream);
+    TORCH_CHECK(pn_status == hipSuccess,
+                "hipMemcpyAsync indice_pair_num failed: ",
+                hipGetErrorString(pn_status));
+    hipError_t pn_sync_status = hipStreamSynchronize(stream);
+    TORCH_CHECK(pn_sync_status == hipSuccess,
+                "hipStreamSynchronize indice_pair_num failed: ",
+                hipGetErrorString(pn_sync_status));
+    if (features.scalar_type() == torch::kFloat32 &&
+        out_bp_contig.scalar_type() == torch::kFloat32 &&
+        filters.scalar_type() == torch::kFloat32) {
+        if (subm && !inverse) {
+            auto center_grad = dfilters.select(0, center);
+            at::mm_out(center_grad, features.t(), out_bp_contig);
+        }
+
+        std::vector<int> active_ks;
+        active_ks.reserve(kv);
+        for (int i = 0; i < kv; ++i) {
+            if (pn[i] == 0) {
+                continue;
+            }
+            if (subm && !inverse && i == center) {
+                continue;
+            }
+            active_ks.push_back(i);
+        }
+        std::sort(active_ks.begin(), active_ks.end(),
+                  [&](int a, int b) { return pn[a] < pn[b]; });
+
+        if (!active_ks.empty()) {
+            hipblasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
+            at::cuda::blas::PointerModeGuard pointer_mode_guard(handle, HIPBLAS_POINTER_MODE_HOST);
+            auto& workspace = get_workspace(features.device());
+            int64_t kWindowNhotCap = 1500000;
+            if (const char* env = std::getenv("SPCONV_GROUPED_DFILTERS_NHOT_CAP")) {
+                long long parsed = std::atoll(env);
+                if (parsed > 0) {
+                    kWindowNhotCap = parsed;
+                }
+            }
+            size_t free_bytes = 0;
+            size_t total_bytes = 0;
+            if (hipMemGetInfo(&free_bytes, &total_bytes) == hipSuccess) {
+                constexpr size_t kReserveBytes = 256ull << 20;
+                if (free_bytes > kReserveBytes) {
+                    size_t bytes_per_nhot =
+                        ((size_t)(c_in + c_out) * sizeof(float) + 2 * sizeof(int64_t)) * 5 / 4;
+                    int64_t free_cap = static_cast<int64_t>((free_bytes - kReserveBytes) /
+                                                            std::max<size_t>(bytes_per_nhot, 1));
+                    if (free_cap > 0) {
+                        kWindowNhotCap = std::min(kWindowNhotCap, free_cap);
+                    }
+                }
+            }
+            kWindowNhotCap = std::max<int64_t>(kWindowNhotCap, 200000);
+            int64_t total_active_nhot = 0;
+            for (int i : active_ks) {
+                total_active_nhot += pn[i];
+            }
+            int64_t pack_cap = std::min<int64_t>(kWindowNhotCap, total_active_nhot);
+            auto feat_pack_storage = ensure_buffer(
+                workspace.grouped_feat_pack, pack_cap * c_in,
+                features.device(), features.scalar_type(), "grouped_feat_pack");
+            auto out_bp_pack_storage = ensure_buffer(
+                workspace.grouped_out_bp_pack, pack_cap * c_out,
+                out_bp_contig.device(), out_bp_contig.scalar_type(), "grouped_out_bp_pack");
+            auto pair_index_dtype = pair_is_long ? torch::kInt64 : torch::kInt32;
+            auto flat_inp_storage = ensure_buffer(
+                workspace.grouped_flat_inp, pack_cap,
+                features.device(), pair_index_dtype, "grouped_flat_inp");
+            auto flat_out_storage = ensure_buffer(
+                workspace.grouped_flat_out, pack_cap,
+                features.device(), pair_index_dtype, "grouped_flat_out");
+            auto ks_dev_storage = ensure_buffer(
+                workspace.grouped_ks_dev, active_ks.size(),
+                features.device(), torch::kInt32, "grouped_ks_dev");
+            auto offsets_dev_storage = ensure_buffer(
+                workspace.grouped_offsets_dev, active_ks.size() + 1,
+                features.device(), torch::kInt32, "grouped_offsets_dev");
+            size_t begin = 0;
+            while (begin < active_ks.size()) {
+                size_t end = begin;
+                int64_t window_nhot = 0;
+                while (end < active_ks.size()) {
+                    int nhot = pn[active_ks[end]];
+                    if (window_nhot > 0 && window_nhot + nhot > kWindowNhotCap) {
+                        break;
+                    }
+                    window_nhot += nhot;
+                    ++end;
+                }
+
+                auto feat_pack = feat_pack_storage.narrow(0, 0, window_nhot * c_in)
+                    .view({window_nhot, c_in});
+                auto out_bp_pack = out_bp_pack_storage.narrow(0, 0, window_nhot * c_out)
+                    .view({window_nhot, c_out});
+                std::vector<hipblasOperation_t> transa_array;
+                std::vector<hipblasOperation_t> transb_array;
+                std::vector<int> m_array;
+                std::vector<int> n_array;
+                std::vector<int> k_array;
+                std::vector<float> alpha_array;
+                std::vector<const float*> a_array;
+                std::vector<int> lda_array;
+                std::vector<const float*> b_array;
+                std::vector<int> ldb_array;
+                std::vector<float> beta_array;
+                std::vector<float*> c_array;
+                std::vector<int> ldc_array;
+                std::vector<int> group_size;
+                size_t max_groups = end - begin;
+                size_t group_count = 0;
+                transa_array.reserve(max_groups);
+                transb_array.reserve(max_groups);
+                m_array.reserve(max_groups);
+                n_array.reserve(max_groups);
+                k_array.reserve(max_groups);
+                alpha_array.reserve(max_groups);
+                a_array.reserve(max_groups);
+                lda_array.reserve(max_groups);
+                b_array.reserve(max_groups);
+                ldb_array.reserve(max_groups);
+                beta_array.reserve(max_groups);
+                c_array.reserve(max_groups);
+                ldc_array.reserve(max_groups);
+                group_size.reserve(max_groups);
+                std::vector<int> window_ks_host;
+                std::vector<int> seg_offsets_host;
+                window_ks_host.reserve(max_groups);
+                seg_offsets_host.reserve(max_groups + 1);
+                seg_offsets_host.push_back(0);
+
+                int64_t offset = 0;
+                int prev_nhot = -1;
+                for (size_t idx = begin; idx < end; ++idx) {
+                    int i = active_ks[idx];
+                    int nhot = pn[i];
+                    window_ks_host.push_back(i);
+                    seg_offsets_host.push_back(static_cast<int>(offset + nhot));
+                    auto dfilter_i = dfilters.select(0, i);
+                    a_array.push_back(out_bp_pack.data_ptr<float>() + offset * c_out);
+                    b_array.push_back(feat_pack.data_ptr<float>() + offset * c_in);
+                    c_array.push_back(dfilter_i.data_ptr<float>());
+                    if (nhot != prev_nhot) {
+                        transa_array.push_back(HIPBLAS_OP_N);
+                        transb_array.push_back(HIPBLAS_OP_T);
+                        m_array.push_back(c_out);
+                        n_array.push_back(c_in);
+                        k_array.push_back(nhot);
+                        alpha_array.push_back(1.0f);
+                        lda_array.push_back(c_out);
+                        ldb_array.push_back(c_in);
+                        beta_array.push_back(0.0f);
+                        ldc_array.push_back(c_out);
+                        group_size.push_back(1);
+                        prev_nhot = nhot;
+                        ++group_count;
+                    } else {
+                        ++group_size.back();
+                    }
+                    offset += nhot;
+                }
+
+                auto ks_dev = ks_dev_storage.narrow(0, 0, window_ks_host.size());
+                auto offsets_dev = offsets_dev_storage.narrow(0, 0, seg_offsets_host.size());
+                hipError_t ks_status = hipMemcpyAsync(
+                    ks_dev.data_ptr<int>(),
+                    window_ks_host.data(),
+                    window_ks_host.size() * sizeof(int),
+                    hipMemcpyHostToDevice,
+                    (hipStream_t)at::cuda::getCurrentCUDAStream().stream());
+                TORCH_CHECK(ks_status == hipSuccess,
+                            "hipMemcpyAsync ks_dev failed: ",
+                            hipGetErrorString(ks_status));
+                hipError_t offsets_status = hipMemcpyAsync(
+                    offsets_dev.data_ptr<int>(),
+                    seg_offsets_host.data(),
+                    seg_offsets_host.size() * sizeof(int),
+                    hipMemcpyHostToDevice,
+                    (hipStream_t)at::cuda::getCurrentCUDAStream().stream());
+                TORCH_CHECK(offsets_status == hipSuccess,
+                            "hipMemcpyAsync offsets_dev failed: ",
+                            hipGetErrorString(offsets_status));
+                auto flat_inp = flat_inp_storage.narrow(0, 0, window_nhot);
+                auto flat_out = flat_out_storage.narrow(0, 0, window_nhot);
+                hipStream_t stream = (hipStream_t)at::cuda::getCurrentCUDAStream().stream();
+                if (pair_is_long) {
+                    spconv_hip::launch_flatten_indice_pairs_rows<int64_t, int64_t>(
+                        indice_pairs.data_ptr<int64_t>(),
+                        ks_dev.data_ptr<int>(),
+                        offsets_dev.data_ptr<int>(),
+                        static_cast<int>(window_ks_host.size()),
+                        nmax,
+                        gather_axis,
+                        scatter_axis,
+                        flat_inp.data_ptr<int64_t>(),
+                        flat_out.data_ptr<int64_t>(),
+                        static_cast<int>(window_nhot),
+                        stream);
+                } else {
+                    spconv_hip::launch_flatten_indice_pairs_rows<int, int>(
+                        indice_pairs.data_ptr<int>(),
+                        ks_dev.data_ptr<int>(),
+                        offsets_dev.data_ptr<int>(),
+                        static_cast<int>(window_ks_host.size()),
+                        nmax,
+                        gather_axis,
+                        scatter_axis,
+                        flat_inp.data_ptr<int>(),
+                        flat_out.data_ptr<int>(),
+                        static_cast<int>(window_nhot),
+                        stream);
+                }
+                at::index_select_out(feat_pack, features, 0, flat_inp);
+                at::index_select_out(out_bp_pack, out_bp_contig, 0, flat_out);
+
+                hipblasStatus_t status = hipblasSgemmGroupedBatched(
+                    handle,
+                    transa_array.data(),
+                    transb_array.data(),
+                    m_array.data(),
+                    n_array.data(),
+                    k_array.data(),
+                    alpha_array.data(),
+                    a_array.data(),
+                    lda_array.data(),
+                    b_array.data(),
+                    ldb_array.data(),
+                    beta_array.data(),
+                    c_array.data(),
+                    ldc_array.data(),
+                    static_cast<int>(group_count),
+                    group_size.data());
+                TORCH_CHECK(status == HIPBLAS_STATUS_SUCCESS,
+                            "hipblasSgemmGroupedBatched failed with status ", static_cast<int>(status));
+                begin = end;
+            }
+
+            return {din, dfilters};
+        }
+        return {din, dfilters};
+    }
+
+    int max_nhot = 0;
+    for (int i = 0; i < kv; ++i) {
+        if (pn[i] > max_nhot) max_nhot = pn[i];
+    }
+    auto feat_scratch = max_nhot > 0
+        ? torch::empty({max_nhot, c_in}, features.options())
+        : torch::Tensor();
+    auto out_bp_scratch = max_nhot > 0
+        ? torch::empty({max_nhot, c_out}, out_bp_contig.options())
+        : torch::Tensor();
 
     for (int i = 0; i < kv; ++i) {
         int nhot = pn[i];
         if (nhot == 0) continue;
 
-        auto inp_inds = indice_pairs.select(0, i).select(0, 0).slice(0, 0, nhot).to(torch::kLong);
-        auto out_inds = indice_pairs.select(0, i).select(0, 1).slice(0, 0, nhot).to(torch::kLong);
+        if (subm && !inverse && i == center) {
+            auto center_grad = dfilters.select(0, i);
+            at::mm_out(center_grad, features.t(), out_bp_contig);
+            continue;
+        }
 
-        auto inp_gathered = features.index_select(0, inp_inds);    // [nhot, C_in]
-        auto out_bp_gathered = out_bp.index_select(0, out_inds);    // [nhot, C_out]
-        auto w = filters.select(0, i);                              // [C_in, C_out]
+        auto pair = indice_pairs.select(0, i);
+        auto inp_inds = pair.select(0, gather_axis).slice(0, 0, nhot);
+        auto out_inds = pair.select(0, scatter_axis).slice(0, 0, nhot);
+
+        auto inp_gathered = feat_scratch.slice(0, 0, nhot);
+        at::index_select_out(inp_gathered, features, 0, inp_inds);    // [nhot, C_in]
+        auto out_bp_gathered = out_bp_scratch.slice(0, 0, nhot);
+        at::index_select_out(out_bp_gathered, out_bp_contig, 0, out_inds);    // [nhot, C_out]
 
         // dfilters[i] = inp_gathered^T @ out_bp_gathered
-        dfilters.select(0, i) = at::mm(inp_gathered.t(), out_bp_gathered);
-
-        // din: scatter grad back
-        auto din_gathered = at::mm(out_bp_gathered, w.t());
-        din.index_add_(0, inp_inds, din_gathered);
+        auto dfilter_i = dfilters.select(0, i);
+        at::mm_out(dfilter_i, inp_gathered.t(), out_bp_gathered);
     }
 
     return {din, dfilters};
@@ -224,8 +1321,32 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "SubM conv indice pairs (HIP kernel)");
     m.def("get_indice_pairs_conv", &get_indice_pairs_conv,
           "Regular/transposed conv indice pairs (HIP kernel)");
-    m.def("indice_conv_forward", &indice_conv_forward,
+    m.def("indice_conv_forward",
+          [](torch::Tensor features,
+             torch::Tensor filters,
+             torch::Tensor indice_pairs,
+             torch::Tensor indice_pair_num,
+             int64_t num_activate_out,
+             bool inverse,
+             bool subm) {
+              return indice_conv_forward(
+                  features, filters, indice_pairs, indice_pair_num,
+                  num_activate_out, inverse, subm, false);
+          },
           "Sparse conv forward with C++ for-loop (eliminates Python overhead)");
+    m.def("indice_conv_forward_fused",
+          [](torch::Tensor features,
+             torch::Tensor filters,
+             torch::Tensor indice_pairs,
+             torch::Tensor indice_pair_num,
+             int64_t num_activate_out,
+             bool inverse,
+             bool subm) {
+              return indice_conv_forward_fused(
+                  features, filters, indice_pairs, indice_pair_num,
+                  num_activate_out, inverse, subm, false);
+          },
+          "Sparse conv forward with fused HIP kernel");
     m.def("indice_conv_backward", &indice_conv_backward,
           "Sparse conv backward with C++ for-loop");
 }

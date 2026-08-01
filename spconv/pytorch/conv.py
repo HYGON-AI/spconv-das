@@ -104,9 +104,23 @@ class SparseConvolution(SparseModule):
 
         # Get or compute indice pairs
         datas = input.find_indice_pair(self.indice_key) if self.indice_key else None
-
-        if datas is not None:
+        if self.inverse:
+            assert datas is not None and self.indice_key is not None, (
+                "inverse conv requires existing indice_key from coupled forward conv"
+            )
+            assert not datas.is_subm, (
+                "inverse conv can only be used with standard conv/pool indice data"
+            )
+            if datas.ksize is not None:
+                assert datas.ksize == self.kernel_size, (
+                    "inverse conv must have same kernel size as its couple conv"
+                )
             outids = datas.indices
+            indice_pairs = datas.indice_pairs
+            indice_pair_num = datas.indice_pair_num
+            out_spatial_shape = datas.spatial_shape
+        elif datas is not None:
+            outids = datas.out_indices
             indice_pairs = datas.indice_pairs
             indice_pair_num = datas.indice_pair_num
         else:
@@ -118,8 +132,19 @@ class SparseConvolution(SparseModule):
 
             if self.indice_key is not None:
                 indice_data = IndiceData(
-                    outids, indice_pairs, indice_pair_num,
-                    out_spatial_shape, self.subm, self.algo)
+                    indices,
+                    indice_pairs,
+                    indice_pair_num,
+                    spatial_shape,
+                    self.subm,
+                    self.algo,
+                    out_indices=outids,
+                    out_spatial_shape=out_spatial_shape,
+                    ksize=self.kernel_size,
+                    stride=self.stride,
+                    padding=self.padding,
+                    dilation=self.dilation,
+                )
                 input.indice_dict[self.indice_key] = indice_data
 
         num_out = outids.shape[0]
