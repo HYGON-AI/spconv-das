@@ -164,4 +164,7 @@ PYTHONPATH=/path/to/cumm-rocm python test/bench_implicit_gemm.py
 
 ## License
 
-Apache 2.0
+Apache 2.0.
+
+Additional modifications copyright:
+Copyright 2026 Hygon Information Technology Co., Ltd.
