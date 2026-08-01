@@ -1,7 +1,11 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+
 """Test spconv-rocm sparse convolution on ROCm GPU.
 
 Run: python -m pytest test/test_sparse_conv.py -v
-Requires: PyTorch with ROCm support, AMD GPU available.
+Requires: PyTorch with ROCm support, AMD/HCU GPU available.
 """
 
 import pytest

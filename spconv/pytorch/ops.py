@@ -1,3 +1,7 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+
 # spconv-rocm: Sparse convolution ops for ROCm
 # - indice pairs: HIP kernel (primary) / PyTorch native ops (fallback)
 # - GEMM: FlyDSL for fp16/bf16, torch.mm for fp32
