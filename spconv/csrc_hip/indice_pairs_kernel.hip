@@ -7,7 +7,7 @@
 #include <cstdint>
 #include <cstring>
 #include <vector>
-#include "hash_table_hip.h"
+#include "hash_table.h"
 
 namespace spconv_hip {
 
