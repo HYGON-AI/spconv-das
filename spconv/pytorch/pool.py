@@ -39,12 +39,31 @@ class SparseMaxPool(SparseModule):
             self.kernel_size, self.stride, self.padding,
             self.dilation, [0] * self.ndim, subm=False)
 
+        indice_dict = input.indice_dict.copy()
+        if self.indice_key is not None:
+            if self.indice_key in indice_dict:
+                raise ValueError(f"indice key {self.indice_key} exists")
+            indice_dict[self.indice_key] = IndiceData(
+                indices,
+                indice_pairs,
+                indice_pair_num,
+                spatial_shape,
+                False,
+                self.algo,
+                out_indices=outids,
+                out_spatial_shape=out_spatial_shape,
+                ksize=self.kernel_size,
+                stride=self.stride,
+                padding=self.padding,
+                dilation=self.dilation,
+            )
+
         num_out = outids.shape[0]
         out_features = ops.indice_maxpool(features, indice_pairs,
                                           indice_pair_num, num_out)
 
         out = SparseConvTensor(out_features, outids, out_spatial_shape, batch_size)
-        out.indice_dict = input.indice_dict
+        out.indice_dict = indice_dict
         return out
 
 

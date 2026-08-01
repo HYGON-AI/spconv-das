@@ -55,8 +55,9 @@ class SparseConvolution(SparseModule):
         kv = int(np.prod(self.kernel_size))
         self.conv1x1 = (kv == 1) and (int(np.prod(self.stride)) == 1)
 
-        # Weight layout: [kv, C_in, C_out] (KRSC-like, each kernel position has its own weight)
-        if self.conv1x1:
+        if ALL_WEIGHT_IS_KRSC:
+            self.weight = Parameter(torch.Tensor(out_channels, *self.kernel_size, in_channels))
+        elif self.conv1x1:
             self.weight = Parameter(torch.Tensor(in_channels, out_channels))
         else:
             self.weight = Parameter(torch.Tensor(kv, in_channels, out_channels))
@@ -75,6 +76,21 @@ class SparseConvolution(SparseModule):
         if self.bias is not None:
             self.bias.data.uniform_(-stdv, stdv)
 
+    def _weight_to_hcu_layout(self) -> torch.Tensor:
+        weight = self.weight
+        if self.conv1x1 and tuple(weight.shape) == (self.in_channels, self.out_channels):
+            return weight
+        if weight.shape[-2:] == (self.in_channels, self.out_channels):
+            return weight.reshape(-1, self.in_channels, self.out_channels).contiguous()
+
+        # Upstream/public layout: [C_out, *kernel_size, C_in].
+        if weight.shape[0] == self.out_channels and weight.shape[-1] == self.in_channels:
+            if self.conv1x1:
+                return weight.reshape(self.out_channels, self.in_channels).t().contiguous()
+            perm = list(range(1, 1 + self.ndim)) + [self.ndim + 1, 0]
+            return weight.permute(*perm).contiguous().view(-1, self.in_channels, self.out_channels)
+        return weight
+
     def forward(self, input: SparseConvTensor) -> SparseConvTensor:
         assert input.features.shape[1] == self.in_channels
 
@@ -83,12 +99,19 @@ class SparseConvolution(SparseModule):
         spatial_shape = input.spatial_shape
         batch_size = input.batch_size
 
+        weight = self._weight_to_hcu_layout()
+
         if self.conv1x1:
-            out_features = _gemm(features, self.weight)
+            out_features = _gemm(features, weight)
             if self.bias is not None:
                 out_features = out_features + self.bias
             out_tensor = input.replace_feature(out_features)
             return out_tensor
+
+        assume_unique_indices = False
+        if not self.inverse:
+            features, indices, assume_unique_indices = ops.coalesce_duplicate_indices(
+                input, features, indices, spatial_shape)
 
         # Compute output spatial shape
         if self.transposed:
@@ -102,7 +125,7 @@ class SparseConvolution(SparseModule):
                 spatial_shape, self.kernel_size, self.stride,
                 self.padding, self.dilation)
 
-        # Get or compute indice pairs
+        # Get or compute indice pairs.
         datas = input.find_indice_pair(self.indice_key) if self.indice_key else None
         if self.inverse:
             assert datas is not None and self.indice_key is not None, (
@@ -151,8 +174,9 @@ class SparseConvolution(SparseModule):
 
         # Native sparse conv: gather → GEMM → scatter
         out_features = ops.indice_conv(
-            features, self.weight, indice_pairs, indice_pair_num,
-            num_out, inverse=self.inverse, subm=self.subm)
+            features, weight, indice_pairs, indice_pair_num,
+            num_out, inverse=self.inverse, subm=self.subm,
+            assume_unique_indices=assume_unique_indices)
 
         if self.bias is not None:
             out_features = out_features + self.bias

@@ -169,6 +169,12 @@ class SparseConvTensor(metaclass=SpConvTensorMeta):
         if indice_dict is None:
             indice_dict = {}
         self.indice_dict = indice_dict
+        self._coalesced_indices_cache = None
+        self._coalesced_inverse_cache = None
+        self._coalesced_is_unique = None
+        self._coalesced_indices_ptr = None
+        self._coalesced_indices_numel = None
+        self._coalesced_spatial_shape = None
         if grid is None:
             grid = torch.Tensor()  # empty tensor
         self.grid = grid
@@ -208,6 +214,12 @@ class SparseConvTensor(metaclass=SpConvTensorMeta):
         new_spt._timer = self._timer
         new_spt.force_algo = self.force_algo
         new_spt.int8_scale = self.int8_scale
+        new_spt._coalesced_indices_cache = self._coalesced_indices_cache
+        new_spt._coalesced_inverse_cache = self._coalesced_inverse_cache
+        new_spt._coalesced_is_unique = self._coalesced_is_unique
+        new_spt._coalesced_indices_ptr = self._coalesced_indices_ptr
+        new_spt._coalesced_indices_numel = self._coalesced_indices_numel
+        new_spt._coalesced_spatial_shape = self._coalesced_spatial_shape
 
         return new_spt
     
@@ -217,6 +229,12 @@ class SparseConvTensor(metaclass=SpConvTensorMeta):
         new_spt.features = self.features[valid_indices] 
         # reuse data must be cleared after modify indices
         new_spt.indice_dict.clear()
+        new_spt._coalesced_indices_cache = None
+        new_spt._coalesced_inverse_cache = None
+        new_spt._coalesced_is_unique = None
+        new_spt._coalesced_indices_ptr = None
+        new_spt._coalesced_indices_numel = None
+        new_spt._coalesced_spatial_shape = None
         return new_spt
 
     def minus(self):
@@ -315,6 +333,12 @@ class SparseConvTensor(metaclass=SpConvTensorMeta):
         tensor._timer = self._timer
         tensor.force_algo = self.force_algo
         tensor.int8_scale = self.int8_scale
+        tensor._coalesced_indices_cache = self._coalesced_indices_cache
+        tensor._coalesced_inverse_cache = self._coalesced_inverse_cache
+        tensor._coalesced_is_unique = self._coalesced_is_unique
+        tensor._coalesced_indices_ptr = self._coalesced_indices_ptr
+        tensor._coalesced_indices_numel = self._coalesced_indices_numel
+        tensor._coalesced_spatial_shape = self._coalesced_spatial_shape
         return tensor
 
 def expand_nd(ndim: int, val: Union[int, List[int], Tuple[int, ...], np.ndarray]) -> List[int]:

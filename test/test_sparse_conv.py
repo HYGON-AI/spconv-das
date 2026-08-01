@@ -93,7 +93,7 @@ class TestSparseConv3d:
         out = conv(x)
 
         assert out.features.shape == (num_points, out_ch)
-        ref = torch.mm(x.features, conv.weight)
+        ref = torch.mm(x.features, conv.weight.reshape(conv.weight.shape[0], conv.weight.shape[-1]).t().contiguous())
         assert torch.allclose(out.features, ref, atol=1e-5)
 
     def test_sequential(self, device):
@@ -156,12 +156,11 @@ class TestNumericalCorrectness:
         # Build dense input and run torch dense conv
         dense_input = x.dense()  # [B, C, D, H, W]
         # Manually compute dense conv for verification
-        weight_3d = conv.weight.data  # [kv=27, C_in, C_out]
-        weight_dense = weight_3d.reshape(3, 3, 3, in_ch, out_ch)
-        weight_dense = weight_dense.permute(4, 3, 0, 1, 2)  # [C_out, C_in, 3, 3, 3]
+        weight_3d = conv.weight.data  # [ C_out, k, k, k, C_in]
+        weight_dense = weight_3d.permute(0, 4, 1, 2, 3)  # [C_out, C_in, 3, 3, 3]
 
         dense_conv = torch.nn.Conv3d(in_ch, out_ch, 3, padding=1, bias=False).to(device)
-        dense_conv.weight.data = weight_dense
+        dense_conv.weight.data = weight_dense.contiguous()
 
         dense_out = dense_conv(dense_input)  # [B, C_out, D, H, W]
 
@@ -577,6 +576,66 @@ class TestFlyDSLGemm:
             out = model(x)
 
         assert out.features.dtype == torch.float16
+        assert out.spatial_shape == [6, 6, 6]
+        assert out.features.shape[1] == 32
+        assert not torch.isnan(out.features).any()
+
+    def test_sparse_conv_bf16_stride(self, device):
+        """Strided sparse conv in bf16 — exercises fused bf16 kernel."""
+        import spconv.pytorch as spconv
+
+        in_ch, out_ch = 16, 32
+        spatial_shape = [10, 10, 10]
+        num_points = 40
+
+        conv = spconv.SparseConv3d(in_ch, out_ch, 3, stride=2, padding=1, bias=False).to(device).bfloat16()
+        x = _make_sparse_input(1, num_points, in_ch, spatial_shape, device, dtype=torch.bfloat16)
+        out = conv(x)
+
+        assert out.features.dtype == torch.bfloat16
+        assert out.spatial_shape == [5, 5, 5]
+        assert not torch.isnan(out.features).any()
+
+    def test_bf16_backward(self, device):
+        """Verify gradients flow through bf16 sparse conv (fused bf16 kernel)."""
+        import spconv.pytorch as spconv
+
+        in_ch, out_ch = 16, 32
+        spatial_shape = [6, 6, 6]
+        num_points = 20
+
+        conv = spconv.SubMConv3d(in_ch, out_ch, 3, padding=1, bias=True).to(device).bfloat16()
+        x = _make_sparse_input(1, num_points, in_ch, spatial_shape, device, dtype=torch.bfloat16)
+        x.features.requires_grad_(True)
+
+        out = conv(x)
+        loss = out.features.sum()
+        loss.backward()
+
+        assert x.features.grad is not None
+        assert x.features.grad.dtype == torch.bfloat16
+        assert conv.weight.grad is not None
+
+    def test_sequential_bf16_inference(self, device):
+        """Full pipeline in bf16 inference mode — exercises fused bf16 kernel."""
+        import spconv.pytorch as spconv
+
+        model = spconv.SparseSequential(
+            spconv.SubMConv3d(8, 16, 3, padding=1, bias=False),
+            spconv.SparseBatchNorm(16),
+            spconv.SparseReLU(),
+            spconv.SparseConv3d(16, 32, 3, stride=2, padding=1, bias=False),
+            spconv.SparseBatchNorm(32),
+            spconv.SparseReLU(),
+        ).to(device).bfloat16()
+        model.eval()
+
+        x = _make_sparse_input(1, 40, 8, [12, 12, 12], device, dtype=torch.bfloat16)
+
+        with torch.no_grad():
+            out = model(x)
+
+        assert out.features.dtype == torch.bfloat16
         assert out.spatial_shape == [6, 6, 6]
         assert out.features.shape[1] == 32
         assert not torch.isnan(out.features).any()
