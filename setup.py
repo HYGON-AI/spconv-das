@@ -20,8 +20,17 @@ setup(
     long_description_content_type="text/markdown",
     url="https://github.com/ZJLi2013/spconv_rocm",
     author="Yan Yan, ZJLi2013 (ROCm port)",
-    python_requires=">=3.10",
+    python_requires=">=3.8",
     packages=find_packages(exclude=("tests",)),
+    include_package_data=True,
+    package_data={
+        "spconv": [
+            "csrc_hip/*.cpp",
+            "csrc_hip/*.hip",
+            "csrc_hip/*.h",
+            "csrc_hip/*.hpp",
+        ],
+    },
     install_requires=[
         "torch",
         "numpy",
