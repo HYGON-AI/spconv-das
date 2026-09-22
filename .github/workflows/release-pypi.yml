@@ -8,8 +8,6 @@ on:
   push:
     branches:
       - main
-      # TODO(临时): 在 hsy-ci 上验证发布链路, 验证通过后删掉这一行再合入 main
-      - hsy-ci
 
   # ---- 手动触发，仅构建产物，不上传 NIGHTLY ----
   workflow_dispatch:
