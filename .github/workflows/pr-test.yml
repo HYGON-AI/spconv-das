@@ -30,8 +30,8 @@ env:
 
 jobs:
   test:
-    # 测试要跑在 HCU 卡上, 用带 GPU 的自托管 runner
-    runs-on: [self-hosted, hcu]
+    # 需要 docker、HCU 卡与内网源访问能力的自托管 runner
+    runs-on: self-hosted
     timeout-minutes: 240
     strategy:
       # 一个 torch 版本的失败不应掩盖另一个版本的结果
