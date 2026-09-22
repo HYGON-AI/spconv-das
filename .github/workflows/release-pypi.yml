@@ -8,6 +8,8 @@ on:
   push:
     branches:
       - main
+      # TODO(临时): 在 hsy-ci 上验证发布链路, 验证通过后删掉这一行再合入 main
+      - hsy-ci
 
   # ---- 手动触发，仅构建产物，不上传 NIGHTLY ----
   workflow_dispatch:
@@ -31,8 +33,9 @@ jobs:
     concurrency:
       group: release-nightly-hcu-${{ github.ref }}-py${{ matrix.torch_version }}
       cancel-in-progress: true
-    # ---- 自托管 HCU runner，在 Docker 容器内执行 ----
-    runs-on: [self-hosted, hcu]
+    # ---- 自托管 runner，在 Docker 容器内执行 ----
+    # 本仓库没有带 hcu 标签的 runner, 加上会因标签取交集为空而一直排队
+    runs-on: self-hosted
     timeout-minutes: 180
     strategy:
       # 一个 torch 版本的失败不应掩盖另一个版本的结果
