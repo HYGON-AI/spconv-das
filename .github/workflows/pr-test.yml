@@ -1,0 +1,143 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+
+name: pr-test
+
+# 仅 PR 创建/更新时触发一次完整编译+测试
+# pull_request_target: 使 fork PR 也能读取主仓 vars; 工作流文件取自 main 分支,
+# 编译测试的仍是 PR 代码。安全注意: 会在主仓上下文执行 fork 代码 (checkout 需
+# allow-unsafe-pr-checkout 显式放行), 禁止在本工作流引用任何 secrets
+on:
+  pull_request_target:
+    branches:
+      - main
+    types:
+      - opened
+      - synchronize
+      - reopened
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-test-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # 显式控制 ninja 并行度以缩短 HIP 内核编译时间
+  MAX_JOBS: "32"
+  DTK_PKG_URL: ${{ vars.RESOURCE_SERVER_URL }}/dtk-pkg/dtk26.04/DTK-26.04-rc4-centos8-x86_64.tar.gz
+  PYPI_URL: ${{ vars.PYPI_URL }}
+
+jobs:
+  test:
+    # 测试要跑在 HCU 卡上, 用带 GPU 的自托管 runner
+    runs-on: [self-hosted, hcu]
+    timeout-minutes: 240
+    strategy:
+      # 一个 torch 版本的失败不应掩盖另一个版本的结果
+      fail-fast: false
+      matrix:
+        # 目前只验 2.11.0, 需要增版本时直接往数组里加
+        torch_version: ["2.11.0"]
+    env:
+      TORCH_VERSION: ${{ matrix.torch_version }}
+    container:
+      # 纯编译基础镜像: 不自带 DTK 与 torch, 下面步骤里自行安装
+      image: ${{ vars.BASE_COMPILE_IMAGE_ROCKY_PY310 }}
+      options: >-
+        --device=/dev/kfd --device=/dev/dri/ --group-add video
+        -v /opt/hyhal/:/opt/hyhal/:ro
+        --shm-size=80G
+        --cap-add=SYS_PTRACE
+        --security-opt seccomp=unconfined
+        --privileged=true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+          # pull_request_target 在受信上下文运行, checkout 默认拒绝拉取 fork 代码,
+          # 本工作流无 secrets, 仅编译测试 PR 代码, 显式放行
+          allow-unsafe-pr-checkout: true
+
+      - name: Integrate latest main
+        # 测试的应该是合入 main 之后的结果: 先把最新 main 合并进当前分支再编译
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 镜像默认用户与 checkout 目录属主不一致时 git 拒绝操作, 显式豁免
+          git config --global --add safe.directory "${GITHUB_WORKSPACE}"
+          target_sha="$(git rev-parse origin/main)"
+          git -c user.name='spconv CI' -c user.email='ci@localhost' \
+              merge --no-edit "${target_sha}"
+          echo "Integrated main ${target_sha}"
+
+      - name: 准备 pip 内网源
+        shell: bash
+        run: |
+          # 基础镜像不带 torch, 需要从内网源装
+          TRUSTED_HOST="${PIP_INDEX#*://}"; TRUSTED_HOST="${TRUSTED_HOST%%/*}"
+          mkdir -p ~/.pip && printf '%s\n' \
+            '[global]' \
+            "index-url = ${PIP_INDEX}" \
+            "trusted-host = ${TRUSTED_HOST}" \
+            > ~/.pip/pip.conf
+        env:
+          PIP_INDEX: ${{ env.PYPI_URL }}/nightly/dtk2604/+simple/
+
+      - name: Install DTK
+        shell: bash
+        run: |
+          cd /opt
+          wget -q "$DTK_PKG_URL"
+          tar -xzf "$(basename "$DTK_PKG_URL")"
+          mv dtk-* dtk
+        env:
+          DTK_PKG_URL: ${{ env.DTK_PKG_URL }}
+
+      - name: Install AICC
+        shell: bash
+        run: |
+          wget ${{ vars.RESOURCE_SERVER_URL }}/ai_cc/Nightly/hcu_llvm_installer.sh
+          bash hcu_llvm_installer.sh --major 1.0.0
+        env:
+          RESOURCE_SERVER_URL: ${{ vars.RESOURCE_SERVER_URL }}
+
+      - name: install deps
+        shell: bash
+        run: |
+          pip install --no-cache-dir numpy==1.26.4 torch==${TORCH_VERSION} \
+              ninja wheel setuptools pytest
+
+      - name: 编译并安装 spconv
+        shell: bash
+        run: |
+          set -euo pipefail
+          source /opt/dtk/env.sh
+          # setup.py 的 ROCM_PATH 默认 /opt/dtk; HIP 源码需 hipcc 作为 host 编译器
+          CXX=hipcc python3 setup.py bdist_wheel
+          pip install --no-deps --force-reinstall dist/*.whl
+
+      - name: 运行 test/test_sparse_conv.py
+        env:
+          PYTHONIOENCODING: utf-8
+          PYTHONUNBUFFERED: "1"
+          HIP_VISIBLE_DEVICES: "0"
+        shell: bash
+        run: |
+          # 加载 DTK 运行环境 (LD_LIBRARY_PATH 等)
+          source /opt/dtk/env.sh
+          # 必须在 test/ 下运行: 仓库根目录的 spconv/ 源码目录会被 python 优先
+          # 加入 sys.path, 遮蔽掉刚装好的、带 _C_hip 扩展的 wheel
+          cd test
+          python3 -c "import spconv; print(f'spconv={spconv.__version__}')"
+          python3 -m pytest -v -p no:cacheprovider --tb=short test_sparse_conv.py
+
+      # 容器内以 root 运行, workspace 里的文件会归 root 所有,
+      # 宿主机上后续 job 的 checkout 无法清理, 退出前清空
+      - name: 清理 workspace
+        if: always()
+        run: rm -rf "${GITHUB_WORKSPACE}"/* "${GITHUB_WORKSPACE}"/.[!.]* || true
