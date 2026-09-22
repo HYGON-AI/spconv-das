@@ -111,8 +111,9 @@ jobs:
       - name: 编译并安装 spconv
         shell: bash
         run: |
-          set -euo pipefail
+          # env.sh 引用了未初始化的变量, 必须在 set -u 之前加载, 否则报 unbound variable
           source /opt/dtk/env.sh
+          set -euo pipefail
           # setup.py 的 ROCM_PATH 默认 /opt/dtk; HIP 源码需 hipcc 作为 host 编译器
           CXX=hipcc python3 setup.py bdist_wheel
           pip install --no-deps --force-reinstall dist/*.whl
