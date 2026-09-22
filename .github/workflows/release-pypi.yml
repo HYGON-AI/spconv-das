@@ -125,8 +125,14 @@ jobs:
         env:
           # CIUpload 需查关联 PR, 注入自动 token
           GITHUB_TOKEN: ${{ github.token }}
+          # 经 env 传入, 避免密码在 run 里被表达式直接展开进命令行
+          PYPI_PASSWORD: ${{ secrets.PYPI_PASSWORD }}
         run: |
-          CIUpload NIGHTLY --devpi_url ${PYPI_URL} --password ${{ secrets.PYPI_PASSWORD }} --dtk_pkg_name $(basename $DTK_PKG_URL) -f output/*.whl --record
+          CIUpload NIGHTLY \
+            --devpi_url "${PYPI_URL}" \
+            --password "${PYPI_PASSWORD}" \
+            --dtk_pkg_name "$(basename "$DTK_PKG_URL")" \
+            -f output/*.whl --record
 
       # 容器内以 root 运行, workspace 里的文件会归 root 所有,
       # 宿主机上后续 job 的 checkout 无法清理, 退出前清空

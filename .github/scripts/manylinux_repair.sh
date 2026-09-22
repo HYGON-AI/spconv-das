@@ -31,7 +31,7 @@ export AUDITWHEEL_LD_LIBRARY_PATH="${TORCH_PATH}/lib:${AUDITWHEEL_LD_LIBRARY_PAT
 GLIBC_VER=$(ldd --version | awk '{print $NF}' | head -n1 | tr -d '\n' | tr '.' '_')
 PLAT="manylinux_${GLIBC_VER}_x86_64"
 
-# HIP/ROCm 运行时由 DCU 驱动提供, torch 库由用户环境的 torch 提供, 均不打进 wheel
+# HIP/ROCm 运行时由 HCU 驱动提供, torch 库由用户环境的 torch 提供, 均不打进 wheel
 excludes=(
   libgalaxyhip.so.5
   libamdhip64.so.5
