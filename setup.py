@@ -49,6 +49,12 @@ def _should_define_using_gcn() -> bool:
     return version < (26, 4)
 
 
+def _is_dtk() -> bool:
+    # DTK versions are year-based (e.g. 25.04); stock ROCm is 6.x/7.x.
+    version = _read_rocm_version_tuple()
+    return version is not None and version[0] >= 20
+
+
 def _spconv_hip_extension():
     csrc_dir = here / "spconv" / "csrc_hip"
     include_dirs = [str(csrc_dir)]
@@ -64,6 +70,9 @@ def _spconv_hip_extension():
     if _should_define_using_gcn():
         cxx_args.append("-D__USING_GCN__")
         nvcc_args.append("-D__USING_GCN__")
+    if _is_dtk():
+        cxx_args.append("-DSPCONV_DTK_DEVICE_PROPS_V2")
+        nvcc_args.append("-DSPCONV_DTK_DEVICE_PROPS_V2")
     return CUDAExtension(
         name="spconv._C_hip",
         sources=[
@@ -71,6 +80,8 @@ def _spconv_hip_extension():
             str(csrc_dir / "indice_pairs_kernel.hip"),
         ],
         include_dirs=include_dirs,
+        # MSVC needs the import library; on Linux torch's hip libs resolve it.
+        libraries=["hipblas"] if os.name == "nt" else [],
         extra_compile_args={
             "cxx": cxx_args,
             "nvcc": nvcc_args,

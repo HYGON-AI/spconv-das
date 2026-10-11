@@ -13,6 +13,12 @@
 #include <vector>
 #include "hash_table.h"
 
+// DTK names the device property query with a _v2 suffix; stock ROCm does not.
+#if !defined(SPCONV_DTK_DEVICE_PROPS_V2)
+#define hipDeviceProp_t_v2 hipDeviceProp_t
+#define hipGetDeviceProperties_v2 hipGetDeviceProperties
+#endif
+
 namespace spconv_hip {
 
 namespace {
@@ -3047,14 +3053,26 @@ using v4h = __attribute__((__vector_size__(4 * sizeof(_Float16)))) _Float16;
 // vec4_bf16: 4 x short fragment consumed by the K=16 bf16 MMAC
 using v4s = __attribute__((__vector_size__(4 * sizeof(short)))) short;
 
+// Callers are compiled out on targets without MMAC; the host routes those
+// devices to the native path (see device_has_half_mmac in the API).
 __device__ __forceinline__ v4f mmac_f16(v4h a, v4h b, v4f c)
 {
+#if defined(__gfx936__) || defined(__gfx938__)
     return __builtin_hcu_mmac_f32_16x16x16_f16(a, b, c);
+#else
+    (void)a; (void)b;
+    return c;
+#endif
 }
 
 __device__ __forceinline__ v4f mmac_bf16(v4s a, v4s b, v4f c)
 {
+#if defined(__gfx936__) || defined(__gfx938__)
     return __builtin_hcu_mmac_f32_16x16x16_bf16(a, b, c);
+#else
+    (void)a; (void)b;
+    return c;
+#endif
 }
 
 template<typename T> struct HalfTraits;
