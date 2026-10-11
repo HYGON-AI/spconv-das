@@ -13,6 +13,32 @@
 #include <string>
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/hip/HIPBlas.h>
+#include <cstring>
+
+#if !defined(SPCONV_DTK_DEVICE_PROPS_V2)
+#define hipDeviceProp_t_v2 hipDeviceProp_t
+#define hipGetDeviceProperties_v2 hipGetDeviceProperties
+#endif
+
+// The fp16/bf16 fused kernels are built on MMAC and compile to empty bodies
+// on other targets, so every half-precision fused route must check this.
+static bool device_has_half_mmac()
+{
+    thread_local int cached_device = -2;
+    thread_local bool cached_has_mmac = false;
+    int device = -1;
+    if (hipGetDevice(&device) != hipSuccess) {
+        return false;
+    }
+    if (device != cached_device) {
+        hipDeviceProp_t_v2 props{};
+        cached_has_mmac = hipGetDeviceProperties_v2(&props, device) == hipSuccess &&
+                          (std::strncmp(props.gcnArchName, "gfx936", 6) == 0 ||
+                           std::strncmp(props.gcnArchName, "gfx938", 6) == 0);
+        cached_device = device;
+    }
+    return cached_has_mmac;
+}
 
 namespace spconv_hip {
 
@@ -882,6 +908,10 @@ torch::Tensor indice_conv_forward_fused_f16(
     bool filters_transposed = false,
     bool assume_unique_indices = false)
 {
+    if (!device_has_half_mmac()) {
+        return indice_conv_forward(features, filters, indice_pairs, indice_pair_num,
+                                   num_activate_out, inverse, subm, filters_transposed);
+    }
     TORCH_CHECK(features.scalar_type() == torch::kHalf, "fp16 fused requires half features");
     TORCH_CHECK(filters.scalar_type()  == torch::kHalf, "fp16 fused requires half filters");
     TORCH_CHECK(features.is_contiguous(), "features must be contiguous");
@@ -973,6 +1003,10 @@ torch::Tensor indice_conv_forward_fused_bf16(
     bool filters_transposed = false,
     bool assume_unique_indices = false)
 {
+    if (!device_has_half_mmac()) {
+        return indice_conv_forward(features, filters, indice_pairs, indice_pair_num,
+                                   num_activate_out, inverse, subm, filters_transposed);
+    }
     TORCH_CHECK(features.scalar_type() == torch::kBFloat16, "bf16 fused requires bfloat16 features");
     TORCH_CHECK(filters.scalar_type()  == torch::kBFloat16, "bf16 fused requires bfloat16 filters");
     TORCH_CHECK(features.is_contiguous(), "features must be contiguous");
@@ -1099,7 +1133,7 @@ std::vector<torch::Tensor> indice_conv_backward(
         use_fused_dinput = false;
     }
     if ((out_bp_contig.scalar_type() == torch::kHalf || out_bp_contig.scalar_type() == torch::kBFloat16) &&
-        c_in < 8 && c_out <= 16) {
+        ((c_in < 8 && c_out <= 16) || !device_has_half_mmac())) {
         use_fused_dinput = false;
     }
     bool cache_dinput_filters_t = true;
@@ -1184,7 +1218,7 @@ std::vector<torch::Tensor> indice_conv_backward(
     }
 
     if ((features.scalar_type() == torch::kHalf || features.scalar_type() == torch::kBFloat16) &&
-        c_in < 8) {
+        (c_in < 8 || !device_has_half_mmac())) {
         use_fused_dfilters = false;
     }
     if (force_native) {
