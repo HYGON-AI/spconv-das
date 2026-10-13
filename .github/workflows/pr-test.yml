@@ -4,10 +4,11 @@
 name: pr-test
 
 # 仅 PR 创建/更新时触发一次完整编译+测试
-# pull_request: 工作流文件与被测代码都取自 PR 分支, 改动当次 PR 即可验证;
-# fork PR 默认拿不到主仓 vars, 如需支持 fork 贡献再改回 pull_request_target
+# pull_request_target: 以主仓上下文运行, fork PR 也能读取主仓 vars;
+# 工作流文件取自 main, 对本文件的改动需合入 main 后才生效;
+# 被测代码需在 checkout 时显式指定 PR head
 on:
-  pull_request:
+  pull_request_target:
     branches:
       - main
     types:
@@ -19,7 +20,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: pr-test-${{ github.ref }}
+  # pull_request_target 下 github.ref 恒为目标分支, 需按 PR 号区分
+  group: pr-test-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -55,6 +57,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
           persist-credentials: false
@@ -62,14 +65,20 @@ jobs:
       - name: Integrate latest main
         # 测试的应该是合入 main 之后的结果: 先把最新 main 合并进当前分支再编译
         shell: bash
+        env:
+          BASE_REPOSITORY: ${{ github.repository }}
+          BASE_REF: ${{ github.event.pull_request.base.ref || 'main' }}
         run: |
           set -euo pipefail
           # 镜像默认用户与 checkout 目录属主不一致时 git 拒绝操作, 显式豁免
           git config --global --add safe.directory "${GITHUB_WORKSPACE}"
-          target_sha="$(git rev-parse origin/main)"
+          # fork PR 的 origin 指向 fork 仓库, 需从主仓拉取最新目标分支
+          git fetch --no-tags "https://github.com/${BASE_REPOSITORY}.git" \
+              "+refs/heads/${BASE_REF}:refs/remotes/ci-base/${BASE_REF}"
+          target_sha="$(git rev-parse "ci-base/${BASE_REF}")"
           git -c user.name='spconv CI' -c user.email='ci@localhost' \
               merge --no-edit "${target_sha}"
-          echo "Integrated main ${target_sha}"
+          echo "Integrated ${BASE_REF} ${target_sha}"
 
       - name: 准备 pip 内网源
         shell: bash
