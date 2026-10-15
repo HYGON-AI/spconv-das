@@ -7,6 +7,7 @@ name: pr-test
 # pull_request_target: 以主仓上下文运行, fork PR 也能读取主仓 vars;
 # 工作流文件取自 main, 对本文件的改动需合入 main 后才生效;
 # 被测代码需在 checkout 时显式指定 PR head
+# fork PR 需维护者打上 ready-hcu 标签后才会在 HCU runner 上运行, 每次新推送需重新打标签 (参考 vllm-das / hcu_probe-das)
 on:
   pull_request_target:
     branches:
@@ -15,13 +16,15 @@ on:
       - opened
       - synchronize
       - reopened
+      - labeled
 
 permissions:
   contents: read
 
 concurrency:
-  # pull_request_target 下 github.ref 恒为目标分支, 需按 PR 号区分
-  group: pr-test-${{ github.event.pull_request.number || github.ref }}
+  # pull_request_target 下 github.ref 恒为目标分支, 需按 PR 号区分;
+  # 打其他标签触发的 run 会被跳过, 单独分组以免取消正在运行的测试
+  group: pr-test-${{ (github.event.action == 'labeled' && github.event.label.name != 'ready-hcu') && github.run_id || github.event.pull_request.number }}
   cancel-in-progress: true
 
 env:
@@ -32,6 +35,14 @@ env:
 
 jobs:
   test:
+    # 主仓分支或组织成员/协作者提的 PR 直接运行;
+    # 其他 fork PR 只在维护者打上 ready-hcu 的那一刻运行 (只有 triage 及以上权限能打标签),
+    # 之后新推送的代码不会自动运行, 需维护者复核后移除并重新打上 ready-hcu
+    if: >-
+      (github.event.action != 'labeled' || github.event.label.name == 'ready-hcu') &&
+      (github.event.pull_request.head.repo.full_name == github.repository ||
+       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association) ||
+       github.event.action == 'labeled')
     # 需要 docker、HCU 卡与内网源访问能力的自托管 runner
     runs-on: self-hosted
     timeout-minutes: 240
@@ -55,12 +66,15 @@ jobs:
         --privileged=true
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
           persist-credentials: false
+          # pull_request_target 下 checkout 默认拒绝拉取 fork 代码, 需显式允许;
+          # fork 代码仅在维护者打 ready-hcu 标签后运行, 且不保留 GITHUB_TOKEN (persist-credentials: false)
+          allow-unsafe-pr-checkout: true
 
       - name: Integrate latest main
         # 测试的应该是合入 main 之后的结果: 先把最新 main 合并进当前分支再编译
