@@ -41,12 +41,17 @@ def _read_rocm_version_tuple(version_file: Path = ROCM_VERSION_FILE):
         return None
     return int(match.group(1)), int(match.group(2))
 
+def _is_dtk_toolkit() -> bool:
+    # Identify the selected toolkit from DTK year-based version metadata.
+    # Missing or unrecognized metadata leaves fused compilation disabled.
+    version = _read_rocm_version_tuple()
+    return version is not None and version[0] >= 20
 
 def _should_define_using_gcn() -> bool:
     version = _read_rocm_version_tuple()
     if version is None:
         return False
-    return version < (26, 4)
+    return _is_dtk_toolkit() and version < (26, 4)
 
 
 def _spconv_hip_extension():
@@ -61,6 +66,10 @@ def _spconv_hip_extension():
         "-U__HIP_NO_HALF_CONVERSIONS__",
         "-U__HIP_NO_HALF_OPERATORS__",
     ]
+    # Compile every fused implementation only with the selected DTK toolkit.
+    if _is_dtk_toolkit():
+        cxx_args.append("-DSPCONV_WITH_HCU_FUSED")
+        nvcc_args.append("-DSPCONV_WITH_HCU_FUSED")
     if _should_define_using_gcn():
         cxx_args.append("-D__USING_GCN__")
         nvcc_args.append("-D__USING_GCN__")
