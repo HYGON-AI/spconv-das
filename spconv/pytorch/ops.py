@@ -895,7 +895,8 @@ def indice_conv(features: torch.Tensor,
         filters = filters_amp
     if hip is not None and features.is_cuda:
         if (_USE_FUSED_FORWARD and _ALLOW_INEXACT_FUSED_FP32 and features.dtype == torch.float32 and
-                filters.dtype == torch.float32):
+                filters.dtype == torch.float32 and
+                hasattr(hip, "indice_conv_forward_fused")):
             if features.requires_grad or filters.requires_grad:
                 out = _IndiceConvFusedFunction.apply(
                     features, filters, indice_pairs, indice_pair_num,

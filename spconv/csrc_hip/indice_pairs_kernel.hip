@@ -17,7 +17,7 @@ namespace spconv_hip {
 
 namespace {
 
-#if defined(__USING_GCN__)
+#if defined(SPCONV_WITH_HCU_FUSED) && defined(__USING_GCN__)
 #define __builtin_hcu_mmac_f32_16x16x16_bf16 __builtin_amdgcn_mmac_f32_16x16x16bf16
 #define __builtin_hcu_mmac_f32_16x16x16_f16 __builtin_amdgcn_mmac_f32_16x16x16f16
 #define __builtin_hcu_mmac_f32_16x16x8f32 __builtin_amdgcn_mmac_f32_16x16x8f32
@@ -129,6 +129,7 @@ T* ensure_host(RawHostBuffer& buffer, size_t count) {
 typedef float v2f __attribute__((ext_vector_type(2)));
 typedef float v4f __attribute__((ext_vector_type(4)));
 
+#ifdef SPCONV_WITH_HCU_FUSED
 __device__ __forceinline__ void wave_barrier_64() {
 #if defined(__gfx936__) || defined(__gfx938__)
     __builtin_amdgcn_wave_barrier();
@@ -136,6 +137,8 @@ __device__ __forceinline__ void wave_barrier_64() {
     __syncthreads();
 #endif
 }
+
+#endif  // SPCONV_WITH_HCU_FUSED
 
 // Max supported spatial dimensions (1D, 2D, 3D, 4D).
 constexpr int kMaxNDim = 4;
@@ -711,6 +714,7 @@ __device__ __forceinline__ float load_filter_value_f32(
         : filters[(k * c_in + ci) * c_out + co];
 }
 
+#ifdef SPCONV_WITH_HCU_FUSED
 __global__ void indice_conv_fused_forward_f32_mmac_kernel(
     const float* __restrict__ features,   // [N_in, C_in]
     const float* __restrict__ filters,    // [kv, C_in, C_out]
@@ -1782,6 +1786,7 @@ __global__ void indice_conv_fused_forward_f32_mmac_multiwave_c32x32_kernel(
     (void)accumulate_existing;
 #endif
 }
+#endif  // SPCONV_WITH_HCU_FUSED
 
 __global__ void indice_conv_fused_forward_f32_kernel(
     const float* __restrict__ features,   // [N_in, C_in]
@@ -1865,6 +1870,7 @@ __global__ void indice_conv_fused_forward_f32_kernel(
     }
 }
 
+#ifdef SPCONV_WITH_HCU_FUSED
 template <typename IndexT>
 __global__ void indice_conv_dfilters_f32_kernel(
     const float* __restrict__ features,   // [N_in, C_in]
@@ -2346,6 +2352,7 @@ __global__ void indice_conv_dfilters_reduce_split_f32_kernel(
     (void)split_partials; (void)dfilters; (void)kv; (void)c_in; (void)c_out; (void)split_count;
 #endif
 }
+#endif  // SPCONV_WITH_HCU_FUSED
 
 // ============================================================================
 // Host-side orchestration (called from PyTorch C++ extension)
@@ -2692,6 +2699,7 @@ void launch_indice_conv_forward_fused_f32(
     bool filters_transposed,
     hipStream_t stream)
 {
+#ifdef SPCONV_WITH_HCU_FUSED
     bool use_mmac = false;
     int mmac_waves = c_out >= 64 ? 4 : (c_out >= 32 ? 2 : 1);
     if (c_in % 8 == 0) {
@@ -2836,7 +2844,9 @@ void launch_indice_conv_forward_fused_f32(
                                accumulate_existing,
                                filters_transposed);
         }
-    } else {
+    } else
+#endif  // SPCONV_WITH_HCU_FUSED
+    {
         constexpr int kRowTile = 8;
         constexpr int kCoutChunk = 32;
         constexpr int kThreads = kRowTile * kCoutChunk;
@@ -2852,6 +2862,7 @@ void launch_indice_conv_forward_fused_f32(
     }
 }
 
+#ifdef SPCONV_WITH_HCU_FUSED
 template <typename IndexT>
 void launch_indice_conv_dfilters_f32(
     const float* features,
@@ -2885,7 +2896,7 @@ void launch_indice_conv_dfilters_f32(
         use_mmac = cached_use_mmac;
     }
     if (const char* env = std::getenv("SPCONV_DFILTERS_USE_MMAC")) {
-        use_mmac = std::atoi(env) != 0;
+        use_mmac = use_mmac && std::atoi(env) != 0;
     }
     if (use_mmac) {
         if (const char* env = std::getenv("SPCONV_DFILTERS_MMAC_WAVES")) {
@@ -2951,6 +2962,8 @@ void launch_indice_conv_dfilters_f32(
                            dfilters, kv, c_in, c_out, nmax, gather_axis, scatter_axis);
     }
 }
+
+#endif  // SPCONV_WITH_HCU_FUSED
 
 template <typename IndexT>
 __global__ void gather_rows_f32x4_kernel(
@@ -3020,12 +3033,15 @@ template void build_indice_conv_lut_epoch<int64_t>(
     const int64_t*, const int*, int64_t*, int*, int*, int*,
     int, int, int, int, int, bool, unsigned int, hipStream_t);
 
+#ifdef SPCONV_WITH_HCU_FUSED
 template void launch_indice_conv_dfilters_f32<int32_t>(
     const float*, const float*, const int*, const int*, float*,
     int, int, int, int, int, int, float*, bool, hipStream_t);
 template void launch_indice_conv_dfilters_f32<int64_t>(
     const float*, const float*, const int64_t*, const int*, float*,
     int, int, int, int, int, int, float*, bool, hipStream_t);
+#endif  // SPCONV_WITH_HCU_FUSED
+
 template void launch_gather_rows_f32<int32_t>(
     const float*, const int32_t*, float*, int, int, hipStream_t);
 template void launch_gather_rows_f32<int64_t>(
@@ -3042,6 +3058,7 @@ template void launch_flatten_indice_pairs_rows<int64_t, int64_t>(
 // Requires -U__HIP_NO_HALF_CONVERSIONS__ -U__HIP_NO_HALF_OPERATORS__ in cuda_cflags.
 // ==========================================================================
 
+#ifdef SPCONV_WITH_HCU_FUSED
 // vec4_fp16: 4 x half fragment consumed by the K=16 fp16 MMAC
 using v4h = __attribute__((__vector_size__(4 * sizeof(_Float16)))) _Float16;
 // vec4_bf16: 4 x short fragment consumed by the K=16 bf16 MMAC
@@ -3987,6 +4004,8 @@ void launch_indice_conv_accumulate_duplicates_bf16(
                        features, filters, dup_slots, dup_inp, dup_count_dev,
                        out, kv, c_in, c_out, filters_transposed);
 }
+
+#endif  // SPCONV_WITH_HCU_FUSED
 
 // Low-channel SubM FP16 dinput accumulates offsets in a fixed launch order.
 template <typename IndexT>

@@ -107,6 +107,7 @@ void launch_indice_conv_accumulate_duplicates_f32(
     bool filters_transposed,
     hipStream_t stream);
 
+#ifdef SPCONV_WITH_HCU_FUSED
 void launch_indice_conv_accumulate_duplicates_f16(
     const __half* features,
     const __half* filters,
@@ -217,6 +218,8 @@ void launch_indice_conv_dfilters_f32(
     bool deterministic_split,
     hipStream_t stream);
 
+#endif  // SPCONV_WITH_HCU_FUSED
+
 template <typename IndexT, typename FlatIndexT>
 void launch_flatten_indice_pairs_rows(
     const IndexT* indice_pairs,
@@ -261,6 +264,7 @@ struct IndiceConvWorkspace {
     torch::Tensor fused_dup_slots;
     torch::Tensor fused_dup_inp;
     torch::Tensor fused_dup_count;
+
     torch::Tensor grouped_feat_pack;
     torch::Tensor grouped_out_pack;
     torch::Tensor grouped_out_bp_pack;
@@ -272,7 +276,9 @@ struct IndiceConvWorkspace {
     torch::Tensor grouped_offsets_host;
     torch::Tensor host_indice_pair_num;
     torch::Tensor dinput_filters_t;
+#ifdef SPCONV_WITH_HCU_FUSED
     torch::Tensor dfilters_split_partials;
+#endif
     unsigned int fused_lut_epoch = 1;
 };
 
@@ -347,6 +353,7 @@ torch::Tensor ensure_matrix(torch::Tensor& cache,
     auto flat = ensure_buffer(cache, rows * cols, device, dtype, name);
     return flat.view({rows, cols});
 }
+
 
 }  // namespace
 
@@ -871,6 +878,7 @@ torch::Tensor indice_conv_forward_fused(
 // ---------------------------------------------------------------------------
 
 // fp16 fused forward — same LUT/workspace infrastructure as f32 path
+#ifdef SPCONV_WITH_HCU_FUSED
 torch::Tensor indice_conv_forward_fused_f16(
     torch::Tensor features,
     torch::Tensor filters,
@@ -1053,6 +1061,8 @@ torch::Tensor indice_conv_forward_fused_bf16(
 }
 
 
+#endif  // SPCONV_WITH_HCU_FUSED
+
 // indice_conv backward: C++ for-loop
 // ---------------------------------------------------------------------------
 std::vector<torch::Tensor> indice_conv_backward(
@@ -1079,6 +1089,7 @@ std::vector<torch::Tensor> indice_conv_backward(
     const char* force_native_env = std::getenv("SPCONV_FORCE_NATIVE");
     const bool force_native =
         force_native_env != nullptr && std::atoi(force_native_env) != 0;
+#ifdef SPCONV_WITH_HCU_FUSED
     bool use_fused_dinput =
         (out_bp_contig.scalar_type() == torch::kFloat32 &&
          filters.scalar_type() == torch::kFloat32) ||
@@ -1295,6 +1306,12 @@ std::vector<torch::Tensor> indice_conv_backward(
     if (use_fused_dfilters) {
         return {din, dfilters};
     }
+#else
+    auto filters_t = filters.transpose(1, 2).contiguous();
+    auto din = indice_conv_forward(out_bp_contig, filters_t, indice_pairs,
+                                   indice_pair_num, n_in, !inverse, subm);
+    auto dfilters = torch::zeros_like(filters);
+#endif  // SPCONV_WITH_HCU_FUSED
 
     auto pn_host = ensure_host_buffer(
         workspace.host_indice_pair_num, kv, torch::kInt32, "host_indice_pair_num");
@@ -1313,6 +1330,7 @@ std::vector<torch::Tensor> indice_conv_backward(
     TORCH_CHECK(pn_sync_status == hipSuccess,
                 "hipStreamSynchronize indice_pair_num failed: ",
                 hipGetErrorString(pn_sync_status));
+#ifdef SPCONV_WITH_HCU_FUSED
     if (features.scalar_type() == torch::kFloat32 &&
         out_bp_contig.scalar_type() == torch::kFloat32 &&
         filters.scalar_type() == torch::kFloat32) {
@@ -1576,6 +1594,7 @@ std::vector<torch::Tensor> indice_conv_backward(
         }
         return {din, dfilters};
     }
+#endif
 
     int max_nhot = 0;
     for (int i = 0; i < kv; ++i) {
@@ -1633,6 +1652,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                   num_activate_out, inverse, subm, false);
           },
           "Sparse conv forward with C++ for-loop (eliminates Python overhead)");
+#ifdef SPCONV_WITH_HCU_FUSED
     m.def("indice_conv_forward_fused_f16",
               [](torch::Tensor features, torch::Tensor filters,
                  torch::Tensor indice_pairs, torch::Tensor indice_pair_num,
@@ -1651,6 +1671,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                       num_activate_out, inverse, subm, false, true);
               },
               "Fused fp16 sparse conv forward with unique indices (gfx936/gfx938)");
+#endif  // SPCONV_WITH_HCU_FUSED
     m.def("indice_conv_forward_fused",
           [](torch::Tensor features,
              torch::Tensor filters,
@@ -1679,6 +1700,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Sparse conv forward with fused HIP kernel and unique input pairs");
     m.def("indice_conv_backward", &indice_conv_backward,
           "Sparse conv backward with C++ for-loop");
+#ifdef SPCONV_WITH_HCU_FUSED
     m.def("indice_conv_forward_fused_bf16",
               [](torch::Tensor features, torch::Tensor filters,
                  torch::Tensor indice_pairs, torch::Tensor indice_pair_num,
@@ -1697,4 +1719,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                       num_activate_out, inverse, subm, false, true);
               },
               "Fused bf16 sparse conv forward with unique indices (gfx936/gfx938)");
+#endif  // SPCONV_WITH_HCU_FUSED
 }
