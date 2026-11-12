@@ -28,9 +28,9 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  TORCH_VERSION: "2.11.0"
   # 显式控制 ninja 并行度以缩短 HIP 内核编译时间
   MAX_JOBS: "32"
-  DTK_PKG_URL: ${{ vars.RESOURCE_SERVER_URL }}/dtk-pkg/dtk26.04/DTK-26.04-rc4-centos8-x86_64.tar.gz
   PYPI_URL: ${{ vars.PYPI_URL }}
 
 jobs:
@@ -47,16 +47,17 @@ jobs:
     runs-on: self-hosted
     timeout-minutes: 240
     strategy:
-      # 一个 torch 版本的失败不应掩盖另一个版本的结果
       fail-fast: false
       matrix:
-        # 目前只验 2.11.0, 需要增版本时直接往数组里加
-        torch_version: ["2.11.0"]
-    env:
-      TORCH_VERSION: ${{ matrix.torch_version }}
+        include:
+          - dtk: "2604"
+            image: BASE_IMAGE_UBUNTU_DTK2604_PY310
+            aicc: "1.0.0"
+          - dtk: "2610"
+            image: BASE_IMAGE_UBUNTU_DTK2610_PY312
+            aicc: "2.0.0"
     container:
-      # 纯编译基础镜像: 不自带 DTK 与 torch, 下面步骤里自行安装
-      image: ${{ vars.BASE_COMPILE_IMAGE_ROCKY_PY310 }}
+      image: ${{ vars[matrix.image] }}
       options: >-
         --device=/dev/kfd --device=/dev/dri/ --group-add video
         -v /opt/hyhal/:/opt/hyhal/:ro
@@ -97,7 +98,7 @@ jobs:
       - name: 准备 pip 内网源
         shell: bash
         run: |
-          # 基础镜像不带 torch, 需要从内网源装
+          # 从对应 DTK 的内网源安装 PyTorch
           TRUSTED_HOST="${PIP_INDEX#*://}"; TRUSTED_HOST="${TRUSTED_HOST%%/*}"
           mkdir -p ~/.pip && printf '%s\n' \
             '[global]' \
@@ -105,24 +106,15 @@ jobs:
             "trusted-host = ${TRUSTED_HOST}" \
             > ~/.pip/pip.conf
         env:
-          PIP_INDEX: ${{ env.PYPI_URL }}/nightly/dtk2604/+simple/
-
-      - name: Install DTK
-        shell: bash
-        run: |
-          cd /opt
-          wget -q "$DTK_PKG_URL"
-          tar -xzf "$(basename "$DTK_PKG_URL")"
-          mv dtk-* dtk
-        env:
-          DTK_PKG_URL: ${{ env.DTK_PKG_URL }}
+          PIP_INDEX: ${{ env.PYPI_URL }}/nightly/dtk${{ matrix.dtk }}/+simple/
 
       - name: Install AICC
         shell: bash
         run: |
-          wget ${{ vars.RESOURCE_SERVER_URL }}/ai_cc/Nightly/hcu_llvm_installer.sh
-          bash hcu_llvm_installer.sh --major 1.0.0
+          wget "${RESOURCE_SERVER_URL}/ai_cc/Nightly/hcu_llvm_installer.sh"
+          bash hcu_llvm_installer.sh --major "${AICC_VERSION}"
         env:
+          AICC_VERSION: ${{ matrix.aicc }}
           RESOURCE_SERVER_URL: ${{ vars.RESOURCE_SERVER_URL }}
 
       - name: install deps
@@ -153,6 +145,7 @@ jobs:
           # 必须在 test/ 下运行: 仓库根目录的 spconv/ 源码目录会被 python 优先
           # 加入 sys.path, 遮蔽掉刚装好的、带 _C_hip 扩展的 wheel
           cd test
+          python3 -c "import torch; assert torch.cuda.is_available(), 'HCU unavailable'"
           python3 -c "import spconv; print(f'spconv={spconv.__version__}')"
           python3 -m pytest -v -p no:cacheprovider --tb=short test_sparse_conv.py
 
