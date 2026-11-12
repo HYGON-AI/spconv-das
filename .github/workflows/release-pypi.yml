@@ -90,11 +90,14 @@ jobs:
       - name: install deps
         shell: bash
         run: |
-          torch_index_args=()
-          if [[ "${{ matrix.dtk }}" == "2610" ]]; then
-            torch_index_args=(--extra-index-url "${PYPI_URL%/}/das_nightly/dtk2610/+simple/")
-          fi
-          torch_versions="$(python3 -m pip index versions --only-binary=:all: "${torch_index_args[@]}" torch)"
+          set -euo pipefail
+          # nightly/dtk{dtk} 是 devpi 的链式索引, 已聚合真实上传目录
+          # (dtk2604 -> das_nightly/dtk2604-rc4, dtk2610 -> das_nightly/dtk2610),
+          # 无需再额外加 --extra-index-url。
+          # 必须按后缀正则筛 wheel: pip 的 "==2.11.0+dtk2604.*" 对 local version 不生效
+          # (版本匹配时会丢弃 + 之后的部分), 而裸装 torch 会按版本排序选中
+          # "2.11.0+das.opt1.dtk2604.*" 分支构建。正则取第一个匹配即为最新版。
+          torch_versions="$(python3 -m pip index versions --only-binary=:all: torch)"
           torch_wheel_version="$(printf '%s\n' "$torch_versions" | python3 -c '
           import re, sys
           version, dtk = sys.argv[1:]
@@ -108,7 +111,7 @@ jobs:
           sys.exit(f"No compatible torch wheel found for {version}+dtk{dtk}")
           ' "${TORCH_VERSION}" "${{ matrix.dtk }}")"
           echo "Installing torch==${torch_wheel_version}"
-          python3 -m pip install --no-cache-dir "${torch_index_args[@]}" numpy==1.26.4 "torch==${torch_wheel_version}" ninja wheel setuptools
+          python3 -m pip install --no-cache-dir numpy==1.26.4 "torch==${torch_wheel_version}" ninja wheel setuptools
 
       - name: build wheel
         shell: bash
