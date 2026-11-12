@@ -130,6 +130,7 @@ jobs:
           cp dist/*.whl ci-bundle/
           cp test/test_sparse_conv.py ci-bundle/test/
 
+      # 编译和单卡测试使用不同 Runner，通过 artifact 传递同一 DTK 环境的产物。
       - name: 上传 wheel 和对应测试
         uses: actions/upload-artifact@v4
         with:
