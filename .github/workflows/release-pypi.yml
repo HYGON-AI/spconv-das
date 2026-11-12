@@ -106,6 +106,7 @@ jobs:
       - name: Apply DAS local version to wheels
         run: |
           pip install --no-cache-dir ciupload
+          git config --global --add safe.directory "${GITHUB_WORKSPACE}"
           WHEEL_COMMIT_SHA="$(git rev-parse HEAD)"
           CIUpload REPAIR \
             --dtk_version "${{ matrix.dtk }}" \
