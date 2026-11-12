@@ -90,7 +90,11 @@ jobs:
       - name: install deps
         shell: bash
         run: |
-          torch_versions="$(python3 -m pip index versions --only-binary=:all: torch)"
+          torch_index_args=()
+          if [[ "${{ matrix.dtk }}" == "2610" ]]; then
+            torch_index_args=(--extra-index-url "${PYPI_URL%/}/das_nightly/dtk2610/+simple/")
+          fi
+          torch_versions="$(python3 -m pip index versions --only-binary=:all: "${torch_index_args[@]}" torch)"
           torch_wheel_version="$(printf '%s\n' "$torch_versions" | python3 -c '
           import re, sys
           version, dtk = sys.argv[1:]
@@ -104,7 +108,7 @@ jobs:
           sys.exit(f"No compatible torch wheel found for {version}+dtk{dtk}")
           ' "${TORCH_VERSION}" "${{ matrix.dtk }}")"
           echo "Installing torch==${torch_wheel_version}"
-          pip install --no-cache-dir numpy==1.26.4 torch==${torch_wheel_version} ninja wheel setuptools
+          python3 -m pip install --no-cache-dir "${torch_index_args[@]}" numpy==1.26.4 "torch==${torch_wheel_version}" ninja wheel setuptools
 
       - name: build wheel
         shell: bash

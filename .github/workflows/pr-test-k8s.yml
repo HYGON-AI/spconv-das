@@ -114,7 +114,11 @@ jobs:
       - name: install deps
         shell: bash
         run: |
-          torch_versions="$(python3 -m pip index versions --only-binary=:all: torch)"
+          torch_index_args=()
+          if [[ "${{ matrix.dtk }}" == "2610" ]]; then
+            torch_index_args=(--extra-index-url "${PYPI_URL%/}/das_nightly/dtk2610/+simple/")
+          fi
+          torch_versions="$(python3 -m pip index versions --only-binary=:all: "${torch_index_args[@]}" torch)"
           torch_wheel_version="$(printf '%s\n' "$torch_versions" | python3 -c '
           import re, sys
           version, dtk = sys.argv[1:]
@@ -128,7 +132,7 @@ jobs:
           sys.exit(f"No compatible torch wheel found for {version}+dtk{dtk}")
           ' "${TORCH_VERSION}" "${{ matrix.dtk }}")"
           echo "Installing torch==${torch_wheel_version}"
-          pip install --no-cache-dir numpy==1.26.4 "torch==${torch_wheel_version}" \
+          python3 -m pip install --no-cache-dir "${torch_index_args[@]}" numpy==1.26.4 "torch==${torch_wheel_version}" \
               ninja wheel setuptools
           mkdir -p ci-bundle
           printf '%s\n' "$torch_wheel_version" > ci-bundle/torch-version.txt
@@ -196,8 +200,12 @@ jobs:
       - name: 安装测试依赖和 wheel
         shell: bash
         run: |
+          torch_index_args=()
+          if [[ "${{ matrix.dtk }}" == "2610" ]]; then
+            torch_index_args=(--extra-index-url "${PYPI_URL%/}/das_nightly/dtk2610/+simple/")
+          fi
           read -r torch_wheel_version < ci-bundle/torch-version.txt
-          pip install --no-cache-dir numpy==1.26.4 "torch==${torch_wheel_version}" pytest
+          python3 -m pip install --no-cache-dir "${torch_index_args[@]}" numpy==1.26.4 "torch==${torch_wheel_version}" pytest
           pip install --no-deps --force-reinstall ci-bundle/*.whl
 
       - name: 运行单卡测试
