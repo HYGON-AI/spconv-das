@@ -114,6 +114,13 @@ jobs:
       - name: install deps
         shell: bash
         run: |
+          set -euo pipefail
+          # nightly/dtk{dtk} 是 devpi 的链式索引, 已聚合真实上传目录
+          # (dtk2604 -> das_nightly/dtk2604-rc4, dtk2610 -> das_nightly/dtk2610),
+          # 无需再额外加 --extra-index-url。
+          # 必须按后缀正则筛 wheel: pip 的 "==2.11.0+dtk2604.*" 对 local version 不生效
+          # (版本匹配时会丢弃 + 之后的部分), 而裸装 torch 会按版本排序选中
+          # "2.11.0+das.opt1.dtk2604.*" 分支构建。正则取第一个匹配即为最新版。
           torch_versions="$(python3 -m pip index versions --only-binary=:all: torch)"
           torch_wheel_version="$(printf '%s\n' "$torch_versions" | python3 -c '
           import re, sys
@@ -128,7 +135,7 @@ jobs:
           sys.exit(f"No compatible torch wheel found for {version}+dtk{dtk}")
           ' "${TORCH_VERSION}" "${{ matrix.dtk }}")"
           echo "Installing torch==${torch_wheel_version}"
-          pip install --no-cache-dir numpy==1.26.4 "torch==${torch_wheel_version}" \
+          python3 -m pip install --no-cache-dir numpy==1.26.4 "torch==${torch_wheel_version}" \
               ninja wheel setuptools
           mkdir -p ci-bundle
           printf '%s\n' "$torch_wheel_version" > ci-bundle/torch-version.txt
@@ -196,8 +203,10 @@ jobs:
       - name: 安装测试依赖和 wheel
         shell: bash
         run: |
+          set -euo pipefail
+          # 版本由 build job 选定并随 artifact 传来, 这里直接复用, 保证两个 job 装的是同一个包
           read -r torch_wheel_version < ci-bundle/torch-version.txt
-          pip install --no-cache-dir numpy==1.26.4 "torch==${torch_wheel_version}" pytest
+          python3 -m pip install --no-cache-dir numpy==1.26.4 "torch==${torch_wheel_version}" pytest
           pip install --no-deps --force-reinstall ci-bundle/*.whl
 
       - name: 运行单卡测试
