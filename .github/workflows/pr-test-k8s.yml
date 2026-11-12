@@ -113,15 +113,29 @@ jobs:
 
       - name: install deps
         shell: bash
-        run: |
-          set -euo pipefail
+        env:
+          # 索引通过命令行直接传给 pip, 不依赖任何 pip.conf:
+          # 容器 HOME 下同时存在 ~/.pip/pip.conf(旧) 与 ~/.config/pip/pip.conf(新, 优先级更高),
+          # 自托管 runner 的持久 home 里若有历史配置, 会静默把索引换成 pypi 官方源,
+          # 于是列出的 torch 没有 +dtk 本地版本、正则全不匹配。
           # nightly/dtk{dtk} 是 devpi 的链式索引, 已聚合真实上传目录
           # (dtk2604 -> das_nightly/dtk2604-rc4, dtk2610 -> das_nightly/dtk2610),
           # 无需再额外加 --extra-index-url。
+          TORCH_INDEX: ${{ env.PYPI_URL }}/nightly/dtk${{ matrix.dtk }}/+simple/
+        run: |
+          set -euo pipefail
+          echo "image: ${{ vars[matrix.image] }}"
+          echo "python: $(python3 -VV 2>&1)"
+          echo "pip: $(python3 -m pip -V 2>&1)"
+          # 失败时用来区分「索引读错了」和「该索引确实没有这个包」
+          python3 -m pip config debug 2>&1 | sed -n '1,40p' || true
+          TORCH_INDEX_HOST="${TORCH_INDEX#*://}"; TORCH_INDEX_HOST="${TORCH_INDEX_HOST%%/*}"
           # 必须按后缀正则筛 wheel: pip 的 "==2.11.0+dtk2604.*" 对 local version 不生效
           # (版本匹配时会丢弃 + 之后的部分), 而裸装 torch 会按版本排序选中
           # "2.11.0+das.opt1.dtk2604.*" 分支构建。正则取第一个匹配即为最新版。
-          torch_versions="$(python3 -m pip index versions --only-binary=:all: torch)"
+          torch_versions="$(python3 -m pip index versions --only-binary=:all: \
+              --index-url "${TORCH_INDEX}" --trusted-host "${TORCH_INDEX_HOST}" torch)"
+          echo "pip reported: ${torch_versions}"
           torch_wheel_version="$(printf '%s\n' "$torch_versions" | python3 -c '
           import re, sys
           version, dtk = sys.argv[1:]
@@ -132,11 +146,14 @@ jobs:
                       if re.fullmatch(prefix + r"(?:[.-][a-zA-Z0-9]+)*", candidate):
                           print(candidate)
                           sys.exit(0)
-          sys.exit(f"No compatible torch wheel found for {version}+dtk{dtk}")
+                  sys.exit(f"No compatible torch wheel found for {version}+dtk{dtk}\n"
+                           f"pip reported: {line.strip()[:600]}")
+          sys.exit("pip index versions did not return an Available versions line")
           ' "${TORCH_VERSION}" "${{ matrix.dtk }}")"
           echo "Installing torch==${torch_wheel_version}"
-          python3 -m pip install --no-cache-dir numpy==1.26.4 "torch==${torch_wheel_version}" \
-              ninja wheel setuptools
+          python3 -m pip install --no-cache-dir \
+              --index-url "${TORCH_INDEX}" --trusted-host "${TORCH_INDEX_HOST}" \
+              numpy==1.26.4 "torch==${torch_wheel_version}" ninja wheel setuptools
           mkdir -p ci-bundle
           printf '%s\n' "$torch_wheel_version" > ci-bundle/torch-version.txt
 
@@ -202,11 +219,18 @@ jobs:
 
       - name: 安装测试依赖和 wheel
         shell: bash
+        env:
+          # 与 build job 一致: 索引走命令行参数, 不依赖 pip.conf
+          TORCH_INDEX: ${{ env.PYPI_URL }}/nightly/dtk${{ matrix.dtk }}/+simple/
         run: |
           set -euo pipefail
           # 版本由 build job 选定并随 artifact 传来, 这里直接复用, 保证两个 job 装的是同一个包
           read -r torch_wheel_version < ci-bundle/torch-version.txt
-          python3 -m pip install --no-cache-dir numpy==1.26.4 "torch==${torch_wheel_version}" pytest
+          TORCH_INDEX_HOST="${TORCH_INDEX#*://}"; TORCH_INDEX_HOST="${TORCH_INDEX_HOST%%/*}"
+          echo "python: $(python3 -VV 2>&1)"
+          python3 -m pip install --no-cache-dir \
+              --index-url "${TORCH_INDEX}" --trusted-host "${TORCH_INDEX_HOST}" \
+              numpy==1.26.4 "torch==${torch_wheel_version}" pytest
           pip install --no-deps --force-reinstall ci-bundle/*.whl
 
       - name: 运行单卡测试
