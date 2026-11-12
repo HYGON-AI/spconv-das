@@ -90,7 +90,21 @@ jobs:
       - name: install deps
         shell: bash
         run: |
-          pip install --no-cache-dir numpy==1.26.4 torch==${TORCH_VERSION} ninja wheel setuptools
+          torch_versions="$(python3 -m pip index versions --only-binary=:all: torch)"
+          torch_wheel_version="$(printf '%s\n' "$torch_versions" | python3 -c '
+          import re, sys
+          version, dtk = sys.argv[1:]
+          prefix = re.escape(version + "+dtk" + dtk)
+          for line in sys.stdin:
+              if line.startswith("Available versions:"):
+                  for candidate in line.split(":", 1)[1].strip().split(", "):
+                      if re.fullmatch(prefix + r"(?:[.-][a-zA-Z0-9]+)*", candidate):
+                          print(candidate)
+                          sys.exit(0)
+          sys.exit(f"No compatible torch wheel found for {version}+dtk{dtk}")
+          ' "${TORCH_VERSION}" "${{ matrix.dtk }}")"
+          echo "Installing torch==${torch_wheel_version}"
+          pip install --no-cache-dir numpy==1.26.4 torch==${torch_wheel_version} ninja wheel setuptools
 
       - name: build wheel
         shell: bash
